@@ -507,6 +507,18 @@ static const lv_font_t *sensor_tile_pick_font(lv_coord_t budget_px, lv_coord_t *
     return best;
 }
 
+/* Web-editor font overrides (sensor_tile_*_font_px) are expressed as a point
+ * size, but sensor_tile_pick_font() works on a line-height budget. Poppins line
+ * height is ~1.4x the point size, so scale the request before delegating. */
+static const lv_font_t *sensor_tile_pick_font_by_px(int px, lv_coord_t *out_line_h)
+{
+    int budget = (px * 14) / 10;
+    if (budget < 10) {
+        budget = 10;
+    }
+    return sensor_tile_pick_font(budget, out_line_h);
+}
+
 /* Measure (and prepare) a ":ports" row: the value label wraps its full port
  * list in a small font, so the row height is driven by the wrapped text. The
  * caller runs this once to sum up the ports block height and again (during
@@ -571,7 +583,7 @@ static void sensor_tile_apply_layout(sensor_tile_ctx_t *ctx)
         title_budget = 36;
     }
     const lv_font_t *title_font = (ctx->title_font_px > 0)
-        ? sensor_tile_pick_font(ctx->title_font_px, NULL)
+        ? sensor_tile_pick_font_by_px(ctx->title_font_px, NULL)
         : sensor_tile_pick_font(title_budget, NULL);
     lv_obj_set_style_text_font(ctx->title_label, title_font, LV_PART_MAIN);
     lv_obj_set_style_text_align(ctx->title_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
@@ -611,12 +623,12 @@ static void sensor_tile_apply_layout(sensor_tile_ctx_t *ctx)
     const lv_font_t *ip_name_font = APP_FONT_TEXT_12;
     const lv_font_t *ip_value_font = APP_FONT_TEXT_16;
     if (ctx->ip_font_px > 0) {
-        ip_value_font = sensor_tile_pick_font(ctx->ip_font_px, &ip_value_h);
+        ip_value_font = sensor_tile_pick_font_by_px(ctx->ip_font_px, &ip_value_h);
         lv_coord_t name_px = ctx->ip_font_px - 6;
         if (name_px < 10) {
             name_px = 10;
         }
-        ip_name_font = sensor_tile_pick_font(name_px, &ip_name_h);
+        ip_name_font = sensor_tile_pick_font_by_px(name_px, &ip_name_h);
     }
     lv_coord_t ip_row_h = ip_name_h + ip_value_h + 2;
     if (ip_row_h < SENSOR_TILE_IP_ROW_H) {
@@ -628,12 +640,12 @@ static void sensor_tile_apply_layout(sensor_tile_ctx_t *ctx)
     const lv_font_t *power_value_font = APP_FONT_TEXT_28;
     const lv_font_t *power_name_font = APP_FONT_TEXT_16;
     if (ctx->power_font_px > 0) {
-        power_value_font = sensor_tile_pick_font(ctx->power_font_px, &power_value_h);
+        power_value_font = sensor_tile_pick_font_by_px(ctx->power_font_px, &power_value_h);
         lv_coord_t name_px = ctx->power_font_px - 10;
         if (name_px < 10) {
             name_px = 10;
         }
-        power_name_font = sensor_tile_pick_font(name_px, &power_name_h);
+        power_name_font = sensor_tile_pick_font_by_px(name_px, &power_name_h);
     }
     lv_coord_t power_row_h = SENSOR_TILE_POWER_H;
     lv_coord_t power_text_h = power_value_h > power_name_h ? power_value_h : power_name_h;
@@ -647,7 +659,7 @@ static void sensor_tile_apply_layout(sensor_tile_ctx_t *ctx)
     const lv_font_t *ports_value_font = APP_FONT_TEXT_12;
     const lv_font_t *ports_name_font = APP_FONT_TEXT_12;
     if (ctx->ports_font_px > 0) {
-        ports_value_font = sensor_tile_pick_font(ctx->ports_font_px, &ports_value_h);
+        ports_value_font = sensor_tile_pick_font_by_px(ctx->ports_font_px, &ports_value_h);
         ports_name_font = ports_value_font;
         ports_name_h = ports_value_h;
     }
@@ -710,7 +722,7 @@ static void sensor_tile_apply_layout(sensor_tile_ctx_t *ctx)
     lv_coord_t line_h = 0;
     const lv_font_t *row_font;
     if (ctx->row_font_px > 0) {
-        row_font = sensor_tile_pick_font(ctx->row_font_px, &line_h);
+        row_font = sensor_tile_pick_font_by_px(ctx->row_font_px, &line_h);
     } else {
         row_font = sensor_tile_pick_font(row_h > 0 ? row_h : 16, &line_h);
         if (line_h > row_h) {

@@ -477,14 +477,22 @@ static void monitor_apply_layout(monitor_ctx_t *ctx)
         }
     } else if (ctx->style == MONITOR_STYLE_HUD) {
         /* Neon ring: indicator + glow arcs share one diameter, a dotted scale
-         * sits inside the ring and the value/unit are stacked in the middle. */
-        lv_coord_t diam = (cw < main_h) ? cw : main_h;
+         * sits inside the ring and the value/unit are stacked in the middle.
+         * The 30 px glow ring overshoots the arc by ~15 px, so reserve headroom
+         * below the title so the glow never overlaps the title text. */
+        lv_coord_t glow_overshoot = 18;
+        lv_coord_t hud_y = main_y + glow_overshoot;
+        lv_coord_t hud_h = main_h - glow_overshoot;
+        if (hud_h < 60) {
+            hud_h = 60;
+        }
+        lv_coord_t diam = (cw < hud_h) ? cw : hud_h;
         diam -= 10;
         if (diam < 60) {
             diam = 60;
         }
         lv_coord_t cx = cw / 2;
-        lv_coord_t cy = main_y + main_h / 2;
+        lv_coord_t cy = hud_y + hud_h / 2;
         lv_coord_t vh = (diam >= 170) ? 48 : 36;
 
         lv_obj_set_style_text_align(ctx->value_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
