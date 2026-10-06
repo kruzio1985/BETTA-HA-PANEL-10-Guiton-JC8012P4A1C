@@ -112,21 +112,24 @@ static lv_color_t sensor_tile_state_color(const char *state_text)
     return lv_color_hex(APP_UI_COLOR_STATE_ON);
 }
 
-/* Binary on/off colour for ":status" rows: green = online, red = offline. */
+/* Online/offline colour for ":status" rows. Works for binary sensors (on/off),
+ * switches and any numeric sensor used as a device heartbeat: an explicit
+ * off/offline state OR a missing state (unavailable/unknown) = red, anything
+ * else (on, online, or any reported value) = green. */
 static lv_color_t sensor_tile_status_color(const char *state_text)
 {
     if (state_text == NULL || state_text[0] == '\0' ||
         strcmp(state_text, "unavailable") == 0 || strcmp(state_text, "unknown") == 0) {
-        return lv_color_hex(APP_UI_COLOR_CARD_BORDER);
+        return lv_color_hex(APP_UI_COLOR_ERROR);
     }
-    if (strcmp(state_text, "on") == 0 || strcmp(state_text, "online") == 0 ||
-        strcmp(state_text, "running") == 0 || strcmp(state_text, "up") == 0 ||
-        strcmp(state_text, "connected") == 0 || strcmp(state_text, "active") == 0 ||
-        strcmp(state_text, "open") == 0 || strcmp(state_text, "opening") == 0 ||
-        strcmp(state_text, "ready") == 0) {
-        return lv_color_hex(APP_UI_COLOR_OK);
+    if (strcmp(state_text, "off") == 0 || strcmp(state_text, "offline") == 0 ||
+        strcmp(state_text, "stopped") == 0 || strcmp(state_text, "disconnected") == 0 ||
+        strcmp(state_text, "down") == 0 || strcmp(state_text, "closed") == 0 ||
+        strcmp(state_text, "paused") == 0 || strcmp(state_text, "standby") == 0 ||
+        strcmp(state_text, "error") == 0 || strcmp(state_text, "fault") == 0) {
+        return lv_color_hex(APP_UI_COLOR_ERROR);
     }
-    return lv_color_hex(APP_UI_COLOR_ERROR);
+    return lv_color_hex(APP_UI_COLOR_OK);
 }
 
 static bool sensor_tile_parse_float(const char *text, float *out)
