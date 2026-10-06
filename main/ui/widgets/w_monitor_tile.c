@@ -101,6 +101,12 @@ typedef struct {
     int32_t needle_rot;
     uint8_t sub_count;
     monitor_sub_t subs[APP_MAX_MONITOR_SUBS];
+    /* Count-up animation state for the plain big-number style. */
+    float num_value;
+    bool num_valid;
+    char num_unit[16];
+    uint8_t num_decimals;
+    lv_anim_t num_anim;
 } monitor_ctx_t;
 
 static bool monitor_state_is_unavailable(const char *state_text)
@@ -119,6 +125,14 @@ static bool monitor_parse_float(const char *text, float *out)
     char *end = NULL;
     float v = strtof(text, &end);
     if (end == text) {
+        return false;
+    }
+    /* Require the whole token to be a number so an IPv4 address is not
+     * mistaken for a float (see the same guard in w_sensor_tile.c). */
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') {
+        end++;
+    }
+    if (*end != '\0') {
         return false;
     }
     *out = v;
@@ -298,6 +312,57 @@ static void monitor_set_value_text(monitor_ctx_t *ctx, const char *text)
         return;
     }
     lv_label_set_text(ctx->value_label, (text != NULL && text[0] != '\0') ? text : "--");
+}
+
+static void monitor_value_anim_cb(void *var, int32_t v)
+{
+    monitor_ctx_t *ctx = (monitor_ctx_t *)var;
+    if (ctx == NULL || ctx->value_label == NULL) {
+        return;
+    }
+
+    char buf[64] = {0};
+    if (ctx->num_decimals > 0) {
+        snprintf(buf, sizeof(buf), "%.1f", (double)v / 10.0);
+    } else {
+        snprintf(buf, sizeof(buf), "%d", (int)v);
+    }
+    if (ctx->num_unit[0] != '\0') {
+        size_t n = strlen(buf);
+        snprintf(buf + n, sizeof(buf) - n, " %s", ctx->num_unit);
+    }
+    lv_label_set_text(ctx->value_label, buf);
+}
+
+/* Smoothly count up/down to `target` for the plain big-number style. */
+static void monitor_value_count_up(monitor_ctx_t *ctx, float target, const char *unit, bool decimals)
+{
+    if (ctx == NULL || ctx->value_label == NULL) {
+        return;
+    }
+
+    strlcpy(ctx->num_unit, unit != NULL ? unit : "", sizeof(ctx->num_unit));
+    ctx->num_decimals = decimals ? 1U : 0U;
+
+    int scale = decimals ? 10 : 1;
+    int from = ctx->num_valid ? (int)(ctx->num_value * scale + 0.5f) : (int)(target * scale);
+    int to = (int)(target * scale + 0.5f);
+    ctx->num_value = target;
+    ctx->num_valid = true;
+
+    if (from == to) {
+        monitor_value_anim_cb(ctx, to);
+        return;
+    }
+
+    lv_anim_del(&ctx->num_anim, NULL);
+    lv_anim_init(&ctx->num_anim);
+    lv_anim_set_var(&ctx->num_anim, ctx);
+    lv_anim_set_exec_cb(&ctx->num_anim, monitor_value_anim_cb);
+    lv_anim_set_values(&ctx->num_anim, from, to);
+    lv_anim_set_time(&ctx->num_anim, 450);
+    lv_anim_set_path_cb(&ctx->num_anim, lv_anim_path_ease_out);
+    lv_anim_start(&ctx->num_anim);
 }
 
 static void monitor_anim_arc_cb(void *var, int32_t v)
@@ -944,7 +1009,30 @@ static void monitor_update_primary(monitor_ctx_t *ctx, const ha_state_t *state)
     monitor_format_state(state, value_text, sizeof(value_text));
     ctx->unavailable = false;
     monitor_set_status(ctx, true);
-    monitor_set_value_text(ctx, value_text);
+
+    if (ctx->style == MONITOR_STYLE_DEFAULT) {
+        /* Plain big-number style: count up/down to the new value instead of
+         * snapping, so non-gauge stats (e.g. device counts) animate too. */
+        float fvalue = 0.0f;
+        const char *unit = NULL;
+        cJSON *attrs = cJSON_Parse(state->attributes_json);
+        if (attrs != NULL) {
+            cJSON *unit_item = cJSON_GetObjectItemCaseSensitive(attrs, "unit_of_measurement");
+            if (cJSON_IsString(unit_item) && unit_item->valuestring != NULL) {
+                unit = unit_item->valuestring;
+            }
+        }
+        if (monitor_parse_float(state->state, &fvalue)) {
+            monitor_value_count_up(ctx, fvalue, unit, strchr(state->state, '.') != NULL);
+        } else {
+            monitor_set_value_text(ctx, value_text);
+        }
+        if (attrs != NULL) {
+            cJSON_Delete(attrs);
+        }
+    } else {
+        monitor_set_value_text(ctx, value_text);
+    }
 
     if (ctx->bar != NULL || ctx->arc != NULL || ctx->needle != NULL ||
         ctx->style == MONITOR_STYLE_BARS) {

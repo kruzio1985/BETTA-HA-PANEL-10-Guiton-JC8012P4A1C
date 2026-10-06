@@ -112,7 +112,7 @@ static lv_color_t sensor_tile_state_color(const char *state_text)
     return lv_color_hex(APP_UI_COLOR_STATE_ON);
 }
 
-/* Binary on/off colour for ":status" rows: green = on, red = off. */
+/* Binary on/off colour for ":status" rows: green = online, red = offline. */
 static lv_color_t sensor_tile_status_color(const char *state_text)
 {
     if (state_text == NULL || state_text[0] == '\0' ||
@@ -124,7 +124,7 @@ static lv_color_t sensor_tile_status_color(const char *state_text)
         strcmp(state_text, "connected") == 0 || strcmp(state_text, "active") == 0 ||
         strcmp(state_text, "open") == 0 || strcmp(state_text, "opening") == 0 ||
         strcmp(state_text, "ready") == 0) {
-        return lv_color_hex(APP_UI_COLOR_STATE_ON);
+        return lv_color_hex(APP_UI_COLOR_OK);
     }
     return lv_color_hex(APP_UI_COLOR_ERROR);
 }
@@ -137,6 +137,15 @@ static bool sensor_tile_parse_float(const char *text, float *out)
     char *end = NULL;
     float v = strtof(text, &end);
     if (end == text) {
+        return false;
+    }
+    /* Require the whole token to be a number: an IPv4 address like
+     * "83.29.234.104" must NOT be parsed as the float 83.29 (which would then
+     * be rounded to "83.3" in sensor_tile_format_state). */
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') {
+        end++;
+    }
+    if (*end != '\0') {
         return false;
     }
     *out = v;
