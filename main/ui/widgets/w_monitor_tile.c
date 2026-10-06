@@ -17,8 +17,13 @@
 #include "cJSON.h"
 
 #include "ui/fonts/app_text_fonts.h"
+#include "ui/fonts/mdi_font_registry.h"
 #include "ui/ui_memory.h"
 #include "ui/theme/theme_default.h"
+
+/* MDI "lan" glyph (network topology) shown above the big number in the plain
+ * "default" style — used for connected-device counts. */
+#define MONITOR_ICON_LAN "\xF3\xB0\x8C\xA1" /* U+F0321 lan */
 
 #if LV_FONT_MONTSERRAT_24
 #define MONITOR_VALUE_FONT_SMALL APP_FONT_TEXT_24
@@ -85,6 +90,7 @@ typedef struct {
     lv_obj_t *title_label;
     lv_obj_t *status_dot;
     lv_obj_t *value_label;
+    lv_obj_t *icon_label;
     lv_obj_t *bar;
     lv_obj_t *arc;
     lv_obj_t *glow_arc;
@@ -503,10 +509,34 @@ static void monitor_apply_layout(monitor_ctx_t *ctx)
     lv_coord_t main_y = title_h + gap;
 
     if (ctx->style == MONITOR_STYLE_DEFAULT) {
+        /* Plain big-number style with a network icon above the value. */
+        lv_coord_t icon_h = (main_h > 150) ? 56 : 36;
+        lv_coord_t value_h = (main_h > 150) ? 60 : 44;
+        lv_coord_t total_h = icon_h + value_h;
+        if (total_h > main_h) {
+            icon_h = main_h / 2;
+            value_h = main_h - icon_h;
+        }
+        if (ctx->icon_label != NULL) {
+            const lv_font_t *icon_font = mdi_font_icon_56();
+            if (icon_font == NULL) {
+                icon_font = mdi_font_icon_42();
+            }
+            if (icon_font == NULL) {
+                lv_obj_add_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_clear_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_text_font(ctx->icon_label, icon_font, LV_PART_MAIN);
+            }
+            lv_obj_set_style_text_align(ctx->icon_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+            lv_obj_set_style_text_color(ctx->icon_label, lv_color_hex(APP_UI_COLOR_NAV_TAB_ACTIVE), LV_PART_MAIN);
+            lv_obj_set_size(ctx->icon_label, cw, icon_h);
+            lv_obj_set_pos(ctx->icon_label, 0, main_y);
+        }
         lv_obj_set_style_text_font(ctx->value_label, monitor_pick_value_font(ctx), LV_PART_MAIN);
         lv_obj_set_style_text_align(ctx->value_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_set_size(ctx->value_label, cw, main_h);
-        lv_obj_set_pos(ctx->value_label, 0, main_y);
+        lv_obj_set_size(ctx->value_label, cw, value_h);
+        lv_obj_set_pos(ctx->value_label, 0, main_y + icon_h);
     } else if (ctx->style == MONITOR_STYLE_PERCENT) {
         lv_obj_set_style_text_font(ctx->value_label, monitor_pick_value_font(ctx), LV_PART_MAIN);
         lv_obj_set_style_text_align(ctx->value_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -823,6 +853,14 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
     lv_obj_t *ticks[MONITOR_TICK_COUNT] = {0};
     lv_obj_t *needle = NULL;
     lv_obj_t *bars[MONITOR_BAR_COUNT] = {0};
+    lv_obj_t *icon_label = NULL;
+
+    if (style == MONITOR_STYLE_DEFAULT) {
+        /* Plain big-number style: draw a network icon above the value. */
+        icon_label = lv_label_create(card);
+        lv_label_set_text(icon_label, MONITOR_ICON_LAN);
+        lv_label_set_long_mode(icon_label, LV_LABEL_LONG_CLIP);
+    }
 
     if (style == MONITOR_STYLE_PERCENT) {
         bar = lv_bar_create(card);
@@ -948,6 +986,7 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
     ctx->title_label = title;
     ctx->status_dot = dot;
     ctx->value_label = value;
+    ctx->icon_label = icon_label;
     ctx->bar = bar;
     ctx->arc = arc;
     ctx->glow_arc = glow_arc;
