@@ -108,13 +108,24 @@
 #define APP_SETTINGS_PATH "/littlefs/settings.json"
 #define APP_SETTINGS_MAX_JSON_LEN 4096
 
-/* Persistent system/diagnostic log (auto-rotating, bounded on LittleFS). */
+/* Persistent system/diagnostic log (auto-rotating, bounded).  Written to the
+ * microSD card when one is mounted (see system_log.c), because an internal
+ * flash write parks both cores with the caches off and stalls the MIPI-DSI
+ * scan-out — the source of the full-screen "blue flash".  LittleFS is only the
+ * fallback when no card is inserted. */
 #define APP_LOG_DIR "/littlefs/logs"
 #define APP_LOG_FILE "/littlefs/logs/system.log"
 #define APP_LOG_MAX_FILE_BYTES (96 * 1024)
 #define APP_LOG_MAX_ROTATED 3
 #define APP_LOG_RING_BYTES 8192
 #define APP_LOG_HEARTBEAT_MS 30000
+/* While the UI heartbeat watchdog is suspended (storage_guard window) it must
+ * never stay suspended forever: this bounds one suspension. */
+#define APP_LOG_WATCHDOG_PAUSE_MAX_MS 120000
+
+/* storage_guard tuning (see main/diag/storage_guard.c). */
+#define APP_STORAGE_GUARD_LOG_MS 5000
+#define APP_FLASH_WRITER_SETTLE_MS 20
 
 #define APP_WIFI_SSID_MAX_LEN 33
 #define APP_WIFI_PASSWORD_MAX_LEN 65

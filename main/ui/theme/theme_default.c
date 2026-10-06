@@ -8,6 +8,18 @@ static lv_style_t s_style_card;
 static lv_style_t s_style_button_off;
 static lv_style_t s_style_button_on;
 static bool s_initialized = false;
+static int s_tile_transparency = 0; /* 0 = opaque, 100 = fully transparent */
+
+static lv_opa_t card_bg_opa(void)
+{
+    if (s_tile_transparency <= 0) {
+        return LV_OPA_COVER;
+    }
+    if (s_tile_transparency >= 100) {
+        return LV_OPA_TRANSP;
+    }
+    return (lv_opa_t)(255 - (s_tile_transparency * 255 / 100));
+}
 
 static void theme_default_configure_styles(void)
 {
@@ -16,13 +28,13 @@ static void theme_default_configure_styles(void)
     lv_style_set_bg_grad_dir(&s_style_screen, LV_GRAD_DIR_VER);
 
     lv_style_set_bg_color(&s_style_card, lv_color_hex(APP_UI_COLOR_CARD_BG_OFF));
-    lv_style_set_bg_opa(&s_style_card, LV_OPA_COVER);
+    lv_style_set_bg_opa(&s_style_card, card_bg_opa());
     lv_style_set_radius(&s_style_card, APP_UI_CARD_RADIUS);
     lv_style_set_pad_all(&s_style_card, 16);
 #if APP_UI_REWORK_V2
-    lv_style_set_border_width(&s_style_card, 1);
+    lv_style_set_border_width(&s_style_card, 2);
     lv_style_set_border_color(&s_style_card, lv_color_hex(APP_UI_COLOR_CARD_BORDER));
-    lv_style_set_border_opa(&s_style_card, LV_OPA_70);
+    lv_style_set_border_opa(&s_style_card, LV_OPA_COVER);
 #else
     lv_style_set_border_width(&s_style_card, 0);
 #endif
@@ -114,4 +126,20 @@ lv_color_t theme_default_color_text_primary(void)
 lv_color_t theme_default_color_text_muted(void)
 {
     return lv_color_hex(APP_UI_COLOR_TEXT_MUTED);
+}
+
+void theme_default_set_tile_transparency(int percent)
+{
+    if (percent < 0) {
+        percent = 0;
+    }
+    if (percent > 100) {
+        percent = 100;
+    }
+    s_tile_transparency = percent;
+}
+
+int theme_default_get_tile_transparency(void)
+{
+    return s_tile_transparency;
 }

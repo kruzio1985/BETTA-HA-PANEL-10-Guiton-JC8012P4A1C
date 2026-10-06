@@ -35,14 +35,26 @@
 #include "freertos/task.h"
 
 #include "app_config.h"
+#include "diag/storage_guard.h"
 #if CONFIG_APP_PANEL_VARIANT_10INCH_JC
 #include "diag/data_log.h"
+#include "drivers/board_extras_panel10jc.h"
 #endif
 #include "ui/ui_runtime.h"
 
 #include <time.h>
 
 #define TAG "syslog"
+
+/* Preferred persistent log location: the microSD card (SDMMC) when mounted.
+ * Writing the internal flash (LittleFS) parks both cores with the caches off,
+ * which stalls the MIPI-DSI scan-out and makes the panel flash — see the
+ * header comment.  LittleFS remains the fallback when no card is inserted. */
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+#define SYSTEM_LOG_SD_DIR  "/sdcard/logs"
+#define SYSTEM_LOG_SD_FILE SYSTEM_LOG_SD_DIR "/system.log"
+#define SYSTEM_LOG_PATH_BYTES 96
+#endif
 
 #define SYSTEM_LOG_TASK_STACK 4096
 #define SYSTEM_LOG_TASK_PRIO 1
@@ -74,6 +86,13 @@ static int64_t s_ui_last_hb_ms = 0;
 /* Daily restart policy: -1 = fixed 24h-from-boot cadence (default),
  * 0..23 = restart at that local hour (falls back to 24h if time is unset). */
 static int s_daily_restart_hour = -1;
+
+/* UI heartbeat watchdog suspension (counted) and flash-writer gating.  Both
+ * are driven from diag/storage_guard.c around deliberately long storage
+ * operations and the MMU reprogramming inside esp_ota_end(). */
+static uint32_t s_watchdog_pause_depth;
+static int64_t s_watchdog_pause_start_ms;
+static uint32_t s_gated_writes;
 
 /* vprintf line-reconstruction state. With ESP_LOG_VERSION == 2 the hook is
  * called three times per line (prefix, message body, newline) and those calls
@@ -450,23 +469,61 @@ static int system_log_vprintf(const char *fmt, va_list args)
 
 /* ---- Storage ----------------------------------------------------------- */
 
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+static bool system_log_on_sd(void)
+{
+    return sdcard_is_ready();
+}
+
+/* Path of log generation `rot` (0 = the live file) on the active storage. */
+static void system_log_path(int rot, char *out, size_t out_len)
+{
+    const char *file = system_log_on_sd() ? SYSTEM_LOG_SD_FILE : APP_LOG_FILE;
+    if (rot <= 0) {
+        snprintf(out, out_len, "%s", file);
+    } else {
+        snprintf(out, out_len, "%s.%d", file, rot);
+    }
+}
+#else
+static bool system_log_on_sd(void)
+{
+    return false;
+}
+
+static void system_log_path(int rot, char *out, size_t out_len)
+{
+    if (rot <= 0) {
+        snprintf(out, out_len, "%s", APP_LOG_FILE);
+    } else {
+        snprintf(out, out_len, "%s.%d", APP_LOG_FILE, rot);
+    }
+}
+#endif
+
 static void system_log_rotate(void)
 {
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    char old_path[SYSTEM_LOG_PATH_BYTES];
+    char new_path[SYSTEM_LOG_PATH_BYTES];
+#else
     char old_path[sizeof(APP_LOG_FILE) + 4];
     char new_path[sizeof(APP_LOG_FILE) + 4];
+#endif
 
     /* Delete the oldest generation first. */
-    snprintf(old_path, sizeof(old_path), "%s.%d", APP_LOG_FILE, APP_LOG_MAX_ROTATED);
+    system_log_path(APP_LOG_MAX_ROTATED, old_path, sizeof(old_path));
     remove(old_path);
 
     for (int i = APP_LOG_MAX_ROTATED - 1; i >= 1; i--) {
-        snprintf(old_path, sizeof(old_path), "%s.%d", APP_LOG_FILE, i);
-        snprintf(new_path, sizeof(new_path), "%s.%d", APP_LOG_FILE, i + 1);
+        system_log_path(i, old_path, sizeof(old_path));
+        system_log_path(i + 1, new_path, sizeof(new_path));
         rename(old_path, new_path);
     }
 
-    snprintf(old_path, sizeof(old_path), "%s.1", APP_LOG_FILE);
-    rename(APP_LOG_FILE, old_path);
+    system_log_path(1, old_path, sizeof(old_path));
+    system_log_path(0, new_path, sizeof(new_path));
+    rename(new_path, old_path);
 }
 
 static void system_log_file_append(const uint8_t *data, size_t len)
@@ -475,7 +532,29 @@ static void system_log_file_append(const uint8_t *data, size_t len)
         return;
     }
 
-    FILE *f = fopen(APP_LOG_FILE, "ab");
+    /* While the storage guard holds the flash writers (MMU reprogramming in
+     * esp_ota_end) the line must not touch the internal flash.  It stays in the
+     * capture ring and reaches the file once the window closes.  SD writes are
+     * safe and are not gated. */
+    if (storage_guard_flash_writers_paused() && !system_log_on_sd()) {
+        s_gated_writes++;
+        return;
+    }
+
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    char path[SYSTEM_LOG_PATH_BYTES];
+#else
+    char path[sizeof(APP_LOG_FILE) + 4];
+#endif
+    system_log_path(0, path, sizeof(path));
+
+    FILE *f = fopen(path, "ab");
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    if (f == NULL && system_log_on_sd()) {
+        (void)mkdir(SYSTEM_LOG_SD_DIR, 0777);
+        f = fopen(path, "ab");
+    }
+#endif
     if (f == NULL) {
         return;
     }
@@ -492,7 +571,7 @@ static void system_log_file_append(const uint8_t *data, size_t len)
     if ((unsigned long)size + (unsigned long)len > (unsigned long)APP_LOG_MAX_FILE_BYTES) {
         fclose(f);
         system_log_rotate();
-        f = fopen(APP_LOG_FILE, "ab");
+        f = fopen(path, "ab");
         if (f == NULL) {
             return;
         }
@@ -502,8 +581,12 @@ static void system_log_file_append(const uint8_t *data, size_t len)
     fclose(f);
 
 #if CONFIG_APP_PANEL_VARIANT_10INCH_JC
-    /* Mirror every LittleFS log write onto the SD card (buffered, non-blocking). */
-    data_log_mirror_syslog((const char *)data, len);
+    /* The SD mirror is only needed while the primary write still lands on
+     * LittleFS (no card inserted at write time).  With a card mounted the line
+     * above already went straight to /sdcard/logs/system.log. */
+    if (!system_log_on_sd()) {
+        data_log_mirror_syslog((const char *)data, len);
+    }
 #endif
 }
 
@@ -511,6 +594,20 @@ static void system_log_check_ui_watchdog(void)
 {
     if (!ui_runtime_is_running()) {
         return;
+    }
+
+    /* A storage_guard window (SD format, OTA) may legitimately block the UI
+     * task for tens of seconds: suppress the stale-heartbeat restart while a
+     * suspension is active, but never forever (bounded expiry). */
+    if (s_watchdog_pause_depth > 0) {
+        int64_t held_ms = (esp_timer_get_time() / 1000) - s_watchdog_pause_start_ms;
+        if (held_ms <= APP_LOG_WATCHDOG_PAUSE_MAX_MS) {
+            return;
+        }
+        /* The suspension overstayed: drop it so a genuinely hung operation
+         * cannot disable the watchdog indefinitely. */
+        s_watchdog_pause_depth = 0;
+        ESP_LOGW(TAG, "watchdog pause expired after %lld ms", (long long)held_ms);
     }
 
     uint32_t hb = ui_runtime_get_heartbeat();
@@ -812,7 +909,14 @@ int system_log_read_tail(char *buf, size_t buf_len)
 
     system_log_flush();
 
-    FILE *f = fopen(APP_LOG_FILE, "rb");
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    char path[SYSTEM_LOG_PATH_BYTES];
+#else
+    char path[sizeof(APP_LOG_FILE) + 4];
+#endif
+    system_log_path(0, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
     if (f == NULL) {
         buf[0] = '\0';
         return 0;
@@ -851,16 +955,44 @@ esp_err_t system_log_clear(void)
      * lines back into the file after we truncate it. */
     system_log_flush();
 
-    remove(APP_LOG_FILE);
-    for (int i = 1; i <= APP_LOG_MAX_ROTATED; i++) {
-        char path[sizeof(APP_LOG_FILE) + 4];
-        snprintf(path, sizeof(path), "%s.%d", APP_LOG_FILE, i);
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    char path[SYSTEM_LOG_PATH_BYTES];
+#else
+    char path[sizeof(APP_LOG_FILE) + 4];
+#endif
+    for (int i = 0; i <= APP_LOG_MAX_ROTATED; i++) {
+        system_log_path(i, path, sizeof(path));
         remove(path);
     }
 
     /* Leave a fresh line so the viewer shows a start point, not "(no logs)". */
     system_log_heartbeat();
     return ESP_OK;
+}
+
+void system_log_watchdog_suspend(void)
+{
+    if (s_watchdog_pause_depth == 0) {
+        s_watchdog_pause_start_ms = esp_timer_get_time() / 1000;
+    }
+    s_watchdog_pause_depth++;
+}
+
+void system_log_watchdog_resume(void)
+{
+    if (s_watchdog_pause_depth > 0) {
+        s_watchdog_pause_depth--;
+    }
+}
+
+uint32_t system_log_gated_writes(void)
+{
+    return s_gated_writes;
+}
+
+void system_log_gated_writes_reset(void)
+{
+    s_gated_writes = 0;
 }
 
 void system_log_write(const char *tag, const char *fmt, ...)

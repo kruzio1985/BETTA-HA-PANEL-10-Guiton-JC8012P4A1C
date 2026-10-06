@@ -1027,6 +1027,15 @@ esp_err_t ui_runtime_load_layout(const char *layout_json)
     if (ui_pages_count() > 0) {
         ui_pages_show_index(0);
     }
+    /* Re-apply the page wallpaper after the screen rebuild done by
+     * ui_pages_reset() above (which cleared the content-box background). */
+    {
+        runtime_settings_t wallpaper_settings;
+        if (runtime_settings_load(&wallpaper_settings) != ESP_OK) {
+            runtime_settings_set_defaults(&wallpaper_settings);
+        }
+        ui_pages_set_wallpaper(wallpaper_settings.page_wallpaper);
+    }
     ui_runtime_apply_all_states();
     ui_runtime_refresh_topbar();
     display_unlock();
@@ -1195,6 +1204,8 @@ esp_err_t ui_runtime_init(void)
     ui_pages_set_topbar_config(&topbar_cfg);
 
     theme_default_init();
+    theme_default_set_tile_transparency(runtime_settings.tile_transparency);
+    theme_default_rebuild_styles();
     ui_pages_init();
     ui_pages_set_show_callback(ui_runtime_on_page_shown);
     ui_settings_init();

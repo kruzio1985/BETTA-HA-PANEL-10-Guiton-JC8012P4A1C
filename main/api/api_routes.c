@@ -101,6 +101,11 @@ static esp_err_t guarded_api_ota_upload_post(httpd_req_t *req)
     return http_guard_handle(req, api_ota_upload_post_handler);
 }
 
+static esp_err_t guarded_api_ota_switch_slot_post(httpd_req_t *req)
+{
+    return http_guard_handle(req, api_ota_switch_slot_post_handler);
+}
+
 static esp_err_t guarded_api_ha_diagnostics_get(httpd_req_t *req)
 {
     return http_guard_handle(req, api_ha_diagnostics_get_handler);
@@ -342,6 +347,12 @@ esp_err_t api_routes_register(httpd_handle_t server)
         .handler = guarded_api_ota_upload_post,
         .user_ctx = NULL,
     };
+    httpd_uri_t post_ota_switch_slot = {
+        .uri = "/api/ota/switch-slot",
+        .method = HTTP_POST,
+        .handler = guarded_api_ota_switch_slot_post,
+        .user_ctx = NULL,
+    };
 
     httpd_uri_t get_themes_list = {
         .uri = "/api/themes",
@@ -523,6 +534,8 @@ esp_err_t api_routes_register(httpd_handle_t server)
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &get_ota_status), "api_routes", "GET /api/ota/status");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &post_ota_url), "api_routes", "POST /api/ota/url");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &post_ota_upload), "api_routes", "POST /api/ota/upload");
+    ESP_RETURN_ON_ERROR(
+        httpd_register_uri_handler(server, &post_ota_switch_slot), "api_routes", "POST /api/ota/switch-slot");
 
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &get_themes_list), "api_routes", "GET /api/themes");
     ESP_RETURN_ON_ERROR(

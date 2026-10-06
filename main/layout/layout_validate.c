@@ -954,7 +954,8 @@ static bool validate_widget(cJSON *widget, const char *known_widget_ids, size_t 
                 strcmp(v, "percent_bar") != 0 && strcmp(v, "arc") != 0 &&
                 strcmp(v, "arc_semi") != 0 && strcmp(v, "gauge") != 0 &&
                 strcmp(v, "gauge_needle") != 0 && strcmp(v, "bars") != 0 &&
-                strcmp(v, "signal_bars") != 0) {
+                strcmp(v, "signal_bars") != 0 && strcmp(v, "hud") != 0 &&
+                strcmp(v, "ring") != 0) {
                 snprintf(msg, sizeof(msg), "widget %s: bad style_variant",
                     cJSON_IsString(id) ? id->valuestring : "?");
                 layout_validation_add(result, msg);

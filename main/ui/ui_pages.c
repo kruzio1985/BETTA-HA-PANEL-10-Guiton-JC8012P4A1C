@@ -8,9 +8,13 @@
 #include <string.h>
 #include <time.h>
 
+#include "esp_heap_caps.h"
+
 #include "app_config.h"
 #include "ui/fonts/app_text_fonts.h"
+#include "ui/fonts/mdi_font_registry.h"
 #include "ui/ui_i18n.h"
+#include "ui/ui_image_loader.h"
 #include "ui/theme/theme_default.h"
 
 typedef struct {
@@ -53,6 +57,9 @@ static lv_obj_t *s_settings_btn = NULL;
 static lv_obj_t *s_settings_btn_label = NULL;
 static lv_obj_t *s_room_name_label = NULL;
 static lv_obj_t *s_brightness_icon = NULL;
+/* Cached page wallpaper image (decoded at content-box size). */
+static lv_image_dsc_t s_wallpaper_dsc = {0};
+static bool s_wallpaper_loaded = false;
 static ui_topbar_config_t s_topbar_cfg = {
     .show_clock = true,
     .show_room_name = false,
@@ -92,6 +99,20 @@ static uint32_t  s_betta_last_ms = 0;
 #else
 #define TOPBAR_ICON_FONT LV_FONT_DEFAULT
 #endif
+
+/* MDI icon glyphs used by the top bar (the bundled Montserrat faces carry no
+ * LV_SYMBOL_* glyphs, which used to render as empty boxes). */
+#define MDI_ICON_COG "\xF3\xB0\x92\x93"           /* U+F0493 cog */
+#define MDI_ICON_LAN_CONNECT "\xF3\xB0\x8C\x98"   /* U+F0318 lan-connect */
+#define MDI_ICON_WIFI_OFF "\xF3\xB0\xA4\xAE"      /* U+F092E wifi-strength-off-outline */
+
+static const lv_font_t *ui_pages_icon_font(void)
+{
+    if (mdi_font_icon_42_available()) {
+        return mdi_font_icon_42();
+    }
+    return TOPBAR_ICON_FONT;
+}
 
 #define NAV_TEXT_FONT APP_FONT_TEXT_16
 
@@ -393,8 +414,8 @@ static void ui_pages_create_topbar_gear(lv_obj_t *topbar)
     lv_obj_set_style_text_color(s_settings_btn, lv_color_hex(APP_UI_COLOR_TOPBAR_TEXT), LV_PART_MAIN | LV_STATE_PRESSED);
 
     s_settings_btn_label = lv_label_create(s_settings_btn);
-    lv_label_set_text(s_settings_btn_label, LV_SYMBOL_SETTINGS);
-    lv_obj_set_style_text_font(s_settings_btn_label, TOPBAR_ICON_FONT, LV_PART_MAIN);
+    lv_label_set_text(s_settings_btn_label, MDI_ICON_COG);
+    lv_obj_set_style_text_font(s_settings_btn_label, ui_pages_icon_font(), LV_PART_MAIN);
     lv_obj_set_style_text_color(s_settings_btn_label, lv_color_hex(APP_UI_COLOR_TOPBAR_TEXT), LV_PART_MAIN);
     lv_obj_center(s_settings_btn_label);
 }
@@ -454,15 +475,14 @@ static void ui_pages_create_topbar(lv_obj_t *screen)
         lv_obj_set_width(s_api_icon, 86);
         lv_obj_align(s_api_icon, LV_ALIGN_RIGHT_MID, -158, 0);
         ui_pages_style_topbar_chip(s_api_icon);
-        char api_text[32] = {0};
-        snprintf(api_text, sizeof(api_text), "%s %s", ui_i18n_get("topbar.ha", "HA"), LV_SYMBOL_CLOSE);
-        lv_label_set_text(s_api_icon, api_text);
+        lv_label_set_text(s_api_icon, ui_i18n_get("topbar.ha", "HA"));
 
         s_wifi_icon = lv_label_create(s_topbar);
         lv_obj_set_width(s_wifi_icon, 96);
         lv_obj_align(s_wifi_icon, LV_ALIGN_RIGHT_MID, -56, 0);
         ui_pages_style_topbar_chip(s_wifi_icon);
-        lv_label_set_text(s_wifi_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(s_wifi_icon, ui_pages_icon_font(), LV_PART_MAIN);
+        lv_label_set_text(s_wifi_icon, MDI_ICON_WIFI_OFF);
     }
 
     if (s_topbar_cfg.show_brightness) {
@@ -470,7 +490,7 @@ static void ui_pages_create_topbar(lv_obj_t *screen)
         lv_obj_set_width(s_brightness_icon, 86);
         lv_obj_align(s_brightness_icon, LV_ALIGN_RIGHT_MID, s_topbar_cfg.show_status ? -250 : -56, 0);
         ui_pages_style_topbar_chip(s_brightness_icon);
-        lv_label_set_text(s_brightness_icon, LV_SYMBOL_CHARGE);
+        lv_label_set_text(s_brightness_icon, "100%");
     }
 
     ui_pages_create_topbar_gear(s_topbar);
@@ -832,7 +852,7 @@ void ui_pages_set_topbar_brightness(int percent)
         percent = 100;
     }
     char text[16] = {0};
-    snprintf(text, sizeof(text), "%s %d%%", LV_SYMBOL_CHARGE, percent);
+    snprintf(text, sizeof(text), "%d%%", percent);
     lv_label_set_text(s_brightness_icon, text);
 }
 
@@ -843,34 +863,20 @@ void ui_pages_set_topbar_status(
     lv_color_t off = lv_color_hex(APP_UI_COLOR_TOPBAR_STATUS_OFF);
 
     if (s_wifi_icon != NULL) {
-        char wifi_text[32] = {0};
-        snprintf(wifi_text, sizeof(wifi_text), "%s", LV_SYMBOL_CLOSE);
         lv_color_t wifi_color = off;
-        if (wifi_setup_ap_active) {
-            snprintf(wifi_text, sizeof(wifi_text), "%s %s", ui_i18n_get("topbar.ap", "AP"), LV_SYMBOL_WIFI);
-            wifi_color = on;
-        } else if (wifi_connected) {
-            snprintf(wifi_text, sizeof(wifi_text), "%s", LV_SYMBOL_WIFI);
+        const char *wifi_glyph = MDI_ICON_WIFI_OFF;
+        if (wifi_setup_ap_active || wifi_connected) {
+            wifi_glyph = MDI_ICON_LAN_CONNECT;
             wifi_color = on;
         }
-        lv_label_set_text(s_wifi_icon, wifi_text);
+        lv_label_set_text(s_wifi_icon, wifi_glyph);
         lv_obj_set_style_text_color(s_wifi_icon, wifi_color, LV_PART_MAIN);
     }
 
     if (s_api_icon != NULL) {
-        char api_text[32] = {0};
-        snprintf(api_text, sizeof(api_text), "%s %s", ui_i18n_get("topbar.ha", "HA"), LV_SYMBOL_CLOSE);
-        lv_color_t api_color = off;
-        if (api_connected) {
-            if (api_initial_sync_done) {
-                snprintf(api_text, sizeof(api_text), "%s %s", ui_i18n_get("topbar.ha", "HA"), LV_SYMBOL_OK);
-            } else {
-                snprintf(api_text, sizeof(api_text), "%s %s", ui_i18n_get("topbar.ha", "HA"), LV_SYMBOL_REFRESH);
-            }
-            api_color = on;
-        }
-        lv_label_set_text(s_api_icon, api_text);
-        lv_obj_set_style_text_color(s_api_icon, api_color, LV_PART_MAIN);
+        lv_label_set_text(s_api_icon, ui_i18n_get("topbar.ha", "HA"));
+        lv_obj_set_style_text_color(
+            s_api_icon, (api_connected && api_initial_sync_done) ? on : off, LV_PART_MAIN);
     }
 }
 
@@ -892,4 +898,40 @@ void ui_pages_set_topbar_datetime(const struct tm *timeinfo)
     if (s_time_label != NULL) {
         lv_label_set_text(s_time_label, time_buf);
     }
+}
+
+void ui_pages_set_wallpaper(const char *path)
+{
+    /* Free any previously cached image. */
+    if (s_wallpaper_dsc.data != NULL) {
+        heap_caps_free((void *)s_wallpaper_dsc.data);
+        s_wallpaper_dsc.data = NULL;
+    }
+    s_wallpaper_dsc.data_size = 0;
+    s_wallpaper_dsc.header.w = 0;
+    s_wallpaper_dsc.header.h = 0;
+    s_wallpaper_loaded = false;
+
+    if (s_content_box == NULL) {
+        return;
+    }
+
+    lv_obj_set_style_bg_image_src(s_content_box, NULL, LV_PART_MAIN);
+
+    if (path == NULL || path[0] == '\0') {
+        lv_obj_set_style_bg_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
+        return;
+    }
+
+    if (!ui_image_load_file(path, APP_CONTENT_BOX_WIDTH, APP_CONTENT_BOX_HEIGHT, &s_wallpaper_dsc)) {
+        /* Fall back to the solid content background. */
+        lv_obj_set_style_bg_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
+        return;
+    }
+
+    s_wallpaper_loaded = true;
+    lv_obj_set_style_bg_image_src(s_content_box, &s_wallpaper_dsc, LV_PART_MAIN);
+    lv_obj_set_style_bg_image_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_image_tiled(s_content_box, false, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
 }

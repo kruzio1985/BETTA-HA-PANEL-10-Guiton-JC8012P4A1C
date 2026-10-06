@@ -52,3 +52,8 @@ void ui_pages_set_topbar_datetime(const struct tm *timeinfo);
 void ui_pages_set_topbar_config(const ui_topbar_config_t *cfg);
 /* Update the brightness chip label (percent value). Safe to call every second. */
 void ui_pages_set_topbar_brightness(int percent);
+/* Set the page wallpaper shown behind the content tiles. `path` is a PNG/JPEG
+ * reachable via stdio (e.g. "/sdcard/bg/....png"); pass NULL or "" to clear.
+ * Safe to call after ui_pages_init(). The decoded image is cached and freed on
+ * the next call or on ui_pages_reset(). */
+void ui_pages_set_wallpaper(const char *path);

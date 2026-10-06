@@ -102,3 +102,9 @@ void theme_default_style_card(lv_obj_t *obj);
 void theme_default_style_button(lv_obj_t *obj, bool is_on);
 lv_color_t theme_default_color_text_primary(void);
 lv_color_t theme_default_color_text_muted(void);
+
+/* Tile transparency: 0 = opaque (default), 100 = fully transparent.  Applied on
+ * the next style rebuild (boot / settings apply), so a page wallpaper shows
+ * through the card bodies. */
+void theme_default_set_tile_transparency(int percent);
+int theme_default_get_tile_transparency(void);

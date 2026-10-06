@@ -307,6 +307,7 @@ const SETTINGS_NAV_ITEMS = [
   { sectionId: "settingsTimeSection", headingId: "settingsTimeHeading", labelKey: "settings.time.heading" },
   { sectionId: "settingsUiSection", headingId: "settingsUiHeading", labelKey: "settings.ui.heading" },
   { sectionId: "settingsTopbarSection", headingId: "settingsTopbarHeading", labelKey: "settings.topbar.heading" },
+  { sectionId: "settingsAppearanceSection", headingId: "settingsAppearanceHeading", labelKey: "settings.appearance.heading" },
   { sectionId: "settingsDisplaySection", headingId: "settingsDisplayHeading", labelKey: "settings.display.heading" },
   { sectionId: "settingsSystemSection", headingId: "settingsSystemHeading", labelKey: "settings.system.heading" },
   { sectionId: "settingsThemeSection", headingId: "settingsThemeHeading", labelKey: "settings.theme.heading" },
@@ -759,6 +760,12 @@ const WEB_I18N_BUILTIN = {
     "settings.topbar.room_name": "Room name",
     "settings.topbar.show_status": "Show Wi-Fi / HA status",
     "settings.topbar.show_brightness": "Show brightness level",
+    "settings.appearance.heading": "Appearance",
+    "settings.appearance.page_wallpaper": "Page wallpaper (from SD card)",
+    "settings.appearance.page_wallpaper_none": "None (solid background)",
+    "settings.appearance.refresh_list": "Refresh list",
+    "settings.appearance.tile_transparency": "Tile transparency (%)",
+    "settings.appearance.tile_transparency_hint": "Higher values make tiles transparent so the wallpaper shows through. Requires SD card wallpapers.",
     "settings.display.heading": "Display / Screen saver",
     "settings.display.screensaver_enabled": "Screen saver (clock + graphic instead of full off)",
     "settings.display.screensaver_clock": "Show clock on screen saver",
@@ -2304,6 +2311,12 @@ const WEB_I18N_BUILTIN = {
     "settings.topbar.room_name": "Nazwa pokoju",
     "settings.topbar.show_status": "Pokaż status Wi-Fi / HA",
     "settings.topbar.show_brightness": "Pokaż poziom jasności",
+    "settings.appearance.heading": "Wygląd",
+    "settings.appearance.page_wallpaper": "Tapeta strony (z karty SD)",
+    "settings.appearance.page_wallpaper_none": "Brak (jednolite tło)",
+    "settings.appearance.refresh_list": "Odśwież listę",
+    "settings.appearance.tile_transparency": "Przezroczystość kafelków (%)",
+    "settings.appearance.tile_transparency_hint": "Wyższa wartość robi kafelki przezroczyste, aby tapeta była widoczna pod spodem. Wymaga tapet na karcie SD.",
     "settings.display.heading": "Ekran / Wygaszacz",
     "settings.display.screensaver_enabled": "Wygaszacz ekranu (zegar + grafika zamiast pełnego wyłączenia)",
     "settings.display.screensaver_clock": "Pokaż zegar na wygaszaczu",
@@ -2909,6 +2922,11 @@ const el = {
   settingsTopbarRoomName: document.getElementById("settingsTopbarRoomName"),
   settingsTopbarShowStatus: document.getElementById("settingsTopbarShowStatus"),
   settingsTopbarShowBrightness: document.getElementById("settingsTopbarShowBrightness"),
+  settingsAppearanceWallpaperSelect: document.getElementById("settingsAppearanceWallpaperSelect"),
+  settingsAppearanceWallpaperRefreshBtn: document.getElementById("settingsAppearanceWallpaperRefreshBtn"),
+  settingsAppearanceTransparency: document.getElementById("settingsAppearanceTransparency"),
+  settingsAppearanceTransparencyValue: document.getElementById("settingsAppearanceTransparencyValue"),
+  settingsAppearanceInfo: document.getElementById("settingsAppearanceInfo"),
   settingsDailyRestartHour: document.getElementById("settingsDailyRestartHour"),
   settingsAudioVolume: document.getElementById("settingsAudioVolume"),
   restartDeviceBtn: document.getElementById("restartDeviceBtn"),
@@ -3805,6 +3823,12 @@ function applyWebTranslations() {
   setTextById("settingsTopbarShowStatusLabel", "settings.topbar.show_status");
   setTextById("settingsTopbarShowBrightnessLabel", "settings.topbar.show_brightness");
 
+  setTextById("settingsAppearanceHeading", "settings.appearance.heading");
+  setTextById("settingsAppearanceWallpaperSelectLabel", "settings.appearance.page_wallpaper");
+  setTextById("settingsAppearanceWallpaperRefreshBtn", "settings.appearance.refresh_list");
+  setTextById("settingsAppearanceTransparencyLabel", "settings.appearance.tile_transparency");
+  setTextById("settingsAppearanceInfo", "settings.appearance.tile_transparency_hint");
+
   setTextById("settingsDisplayHeading", "settings.display.heading");
   setTextById("settingsScreensaverEnabledLabel", "settings.display.screensaver_enabled");
   setTextById("settingsScreensaverClockLabel", "settings.display.screensaver_clock");
@@ -4025,6 +4049,57 @@ async function loadScreensaverWallpaperList(selectedName) {
   }
 
   const target = selectedName || "";
+  if (target) {
+    let found = false;
+    for (const opt of sel.options) {
+      if (opt.value === target) {
+        opt.selected = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      const custom = document.createElement("option");
+      custom.value = target;
+      custom.textContent = target;
+      custom.selected = true;
+      sel.appendChild(custom);
+    }
+  }
+}
+
+async function loadPageWallpaperList(selectedPath) {
+  const sel = el.settingsAppearanceWallpaperSelect;
+  if (!sel) {
+    return;
+  }
+  let files = [];
+  try {
+    const resp = await fetch("/api/sd/bg/list");
+    const data = await resp.json();
+    files = Array.isArray(data.files) ? data.files : [];
+  } catch (err) {
+    files = [];
+  }
+
+  sel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = t("settings.appearance.page_wallpaper_none");
+  sel.appendChild(none);
+
+  for (const f of files) {
+    const name = typeof f.name === "string" ? f.name : "";
+    if (!/\.(png|jpe?g)$/i.test(name)) {
+      continue; /* the page wallpaper loader decodes PNG and JPEG */
+    }
+    const opt = document.createElement("option");
+    opt.value = "/sdcard/bg/" + name;
+    opt.textContent = `${name} (${formatBytes(f.size || 0)})`;
+    sel.appendChild(opt);
+  }
+
+  const target = selectedPath || "";
   if (target) {
     let found = false;
     for (const opt of sel.options) {
@@ -4539,6 +4614,7 @@ function renderSettings() {
   const system = settings.system || {};
   const display = settings.display || {};
   const topbar = settings.topbar || {};
+  const appearance = settings.appearance || {};
   const scanSupported = wifi.scan_supported !== false;
   editor.wifiScanSupported = scanSupported;
 
@@ -4652,6 +4728,14 @@ function renderSettings() {
   }
   if (el.settingsTopbarShowBrightness) {
     el.settingsTopbarShowBrightness.checked = topbar.show_brightness !== false;
+  }
+  loadPageWallpaperList(typeof appearance.page_wallpaper === "string" ? appearance.page_wallpaper : "");
+  if (el.settingsAppearanceTransparency) {
+    const transp = settingsInt(appearance.tile_transparency, 0, 100, 0);
+    el.settingsAppearanceTransparency.value = String(transp);
+    if (el.settingsAppearanceTransparencyValue) {
+      el.settingsAppearanceTransparencyValue.textContent = `${transp}%`;
+    }
   }
   if (el.settingsDailyRestartHour) {
     populateDailyRestartHour();
@@ -5914,6 +5998,8 @@ async function saveSettings() {
   const topbarRoomName = String(el.settingsTopbarRoomName?.value || "").trim().slice(0, 31);
   const topbarShowStatus = Boolean(el.settingsTopbarShowStatus?.checked ?? true);
   const topbarShowBrightness = Boolean(el.settingsTopbarShowBrightness?.checked ?? true);
+  const pageWallpaper = String(el.settingsAppearanceWallpaperSelect?.value || "");
+  const tileTransparency = settingsInt(el.settingsAppearanceTransparency?.value, 0, 100, 0);
   const dailyRestartHour = settingsInt(el.settingsDailyRestartHour?.value, -1, 23, -1);
   const audioVolume = settingsInt(el.settingsAudioVolume?.value, 0, 100, 70);
   const screensaverEnabled = Boolean(el.settingsScreensaverEnabled?.checked);
@@ -5981,6 +6067,10 @@ async function saveSettings() {
       room_name: topbarRoomName,
       show_status: topbarShowStatus,
       show_brightness: topbarShowBrightness,
+    },
+    appearance: {
+      page_wallpaper: pageWallpaper,
+      tile_transparency: tileTransparency,
     },
     system: {
       touch_test: touchTest,
@@ -10414,6 +10504,20 @@ function bindUi() {
         }
       }
     };
+  }
+  if (el.settingsAppearanceWallpaperRefreshBtn) {
+    el.settingsAppearanceWallpaperRefreshBtn.onclick = () => {
+      const current = el.settingsAppearanceWallpaperSelect?.value || "";
+      void loadPageWallpaperList(current);
+    };
+  }
+  if (el.settingsAppearanceTransparency) {
+    el.settingsAppearanceTransparency.addEventListener("input", () => {
+      const v = settingsInt(el.settingsAppearanceTransparency.value, 0, 100, 0);
+      if (el.settingsAppearanceTransparencyValue) {
+        el.settingsAppearanceTransparencyValue.textContent = `${v}%`;
+      }
+    });
   }
   if (el.provScanWifiBtn) {
     el.provScanWifiBtn.onclick = () => scanWifiNetworks("provisioning");

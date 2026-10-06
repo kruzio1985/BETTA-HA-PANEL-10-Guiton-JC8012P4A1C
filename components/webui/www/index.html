@@ -907,6 +907,23 @@
         </section>
 
         <section>
+          <h2 id="settingsAppearanceHeading">Appearance</h2>
+          <div class="form">
+            <label><span id="settingsAppearanceWallpaperSelectLabel">Page wallpaper (from SD card)</span>
+              <select id="settingsAppearanceWallpaperSelect"></select>
+            </label>
+            <div class="row">
+              <button id="settingsAppearanceWallpaperRefreshBtn" class="btn small" type="button">Refresh list</button>
+            </div>
+            <label><span id="settingsAppearanceTransparencyLabel">Tile transparency (%)</span>
+              <input id="settingsAppearanceTransparency" type="range" min="0" max="100" step="5" value="0" />
+              <span id="settingsAppearanceTransparencyValue" class="meta">0%</span>
+            </label>
+            <div id="settingsAppearanceInfo" class="meta"></div>
+          </div>
+        </section>
+
+        <section>
           <h2 id="settingsDisplayHeading">Display / Screen saver</h2>
           <div class="form">
             <label class="row">

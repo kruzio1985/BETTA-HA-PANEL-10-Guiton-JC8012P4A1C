@@ -182,9 +182,14 @@ void app_main(void)
 
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(init_littlefs());
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    /* Mount the microSD card before the system log starts, so the boot header
+     * and early lines land on /sdcard/logs/system.log (internal-flash writes
+     * stall the DSI scan-out — see system_log.c). */
+    (void)sdcard_init(); /* best effort: no card / bad card must not block boot */
+#endif
     (void)system_log_init(); /* best effort: log capture must not block boot */
 #if CONFIG_APP_PANEL_VARIANT_10INCH_JC
-    (void)sdcard_init(); /* best effort: no card / bad card must not block boot */
     (void)data_log_init(); /* starts the writer task; never blocks */
 #endif
     ESP_ERROR_CHECK(init_net_stack());
@@ -219,6 +224,14 @@ void app_main(void)
     ESP_ERROR_CHECK(display_init());
     touch_debug_set_enabled(s_runtime_settings.touch_test);
     (void)ui_boot_splash_show();
+
+#if CONFIG_APP_PANEL_VARIANT_10INCH_JC
+    /* Pre-decode the screensaver wallpaper while PSRAM is still at its
+     * post-boot maximum (before layout tiles, camera and HA consume it).
+     * The decoded RGB565 is cached for every later screensaver cycle; the
+     * large screensaver.png would fail to decode later under load. */
+    ui_screensaver_preload();
+#endif
 
     ui_boot_splash_set_status(ui_i18n_get("boot.initializing_wifi", "Initializing Wi-Fi"));
 

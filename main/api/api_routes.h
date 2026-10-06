@@ -29,6 +29,7 @@ esp_err_t api_ui_tree_get_handler(httpd_req_t *req);
 esp_err_t api_ota_status_get_handler(httpd_req_t *req);
 esp_err_t api_ota_url_post_handler(httpd_req_t *req);
 esp_err_t api_ota_upload_post_handler(httpd_req_t *req);
+esp_err_t api_ota_switch_slot_post_handler(httpd_req_t *req);
 esp_err_t api_ha_diagnostics_get_handler(httpd_req_t *req);
 esp_err_t api_cameras_get_handler(httpd_req_t *req);
 esp_err_t api_cameras_put_handler(httpd_req_t *req);

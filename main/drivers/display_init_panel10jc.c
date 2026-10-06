@@ -34,6 +34,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "driver/ledc.h"
+#include "hal/mipi_dsi_brg_ll.h"
 #include "lvgl.h"
 
 #include "app_config.h"
@@ -438,6 +439,33 @@ static esp_err_t jc_backlight_init(void)
     return ESP_OK;
 }
 
+/* The DSI bridge substitutes a fixed colour while its pixel FIFO is starved.
+ * ESP-IDF leaves the reserved-data register at its reset value 16383 (RGB565
+ * 0x3FFF = bright cyan) and masks every underrun with discard_vcnt = h_size,
+ * so a momentary DMA starvation paints a light-blue flash over the whole panel
+ * - the same flash that was diagnosed and fixed on the Waveshare 7".  Set the
+ * filler to black (an underrun becomes an invisible dark blink) and unmask the
+ * latch.  Both registers are double-buffered: the write only takes effect after
+ * dpi_config_update, which is what mipi_dsi_brg_ll_update_dpi_config() does.
+ * Must run after esp_lcd_new_panel_jd9365() (it writes discard_vcnt = h_size). */
+static void jc_dsi_underrun_artifact_mitigation(void)
+{
+    dsi_brg_dev_t *brg = MIPI_DSI_LL_GET_BRG(0);
+    if (brg == NULL) {
+        return;
+    }
+    const uint32_t rsv_was = brg->dpi_rsv_dpi_data.dpi_rsv_data;
+    const uint32_t disc_was = brg->dpi_misc_config.fifo_underrun_discard_vcnt;
+
+    brg->dpi_rsv_dpi_data.dpi_rsv_data = 0x0000;
+    brg->dpi_misc_config.fifo_underrun_discard_vcnt = 0;
+    mipi_dsi_brg_ll_update_dpi_config(brg);
+
+    ESP_LOGI(TAG_DISPLAY,
+        "DSI underrun artifact mitigated: rsv_data %" PRIu32 " -> 0, discard_vcnt %" PRIu32 " -> 0 lines",
+        rsv_was, disc_was);
+}
+
 static esp_err_t jc_dsi_phy_power(void)
 {
     /* The JC8012P4A1C board feeds the MIPI-DSI PHY from the LDO_VO3 rail
@@ -606,6 +634,11 @@ esp_err_t display_init(void)
         lv_display_set_antialiasing(s_lv_display, APP_LVGL_ANTIALIASING != 0);
     }
     ESP_LOGI(TAG_DISPLAY, "LVGL antialiasing: %s", (APP_LVGL_ANTIALIASING != 0) ? "on" : "off");
+
+    /* Suppress the cyan/blue underrun flash: this must run after the DPI panel
+     * has been created (esp_lcd_new_panel_jd9365 wrote discard_vcnt = h_size)
+     * and after the LVGL DSI display exists, so nothing re-writes it later. */
+    jc_dsi_underrun_artifact_mitigation();
 
     s_display_ready = true;
     ESP_LOGI(TAG_DISPLAY,

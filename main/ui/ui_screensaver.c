@@ -3,12 +3,10 @@
  */
 #include "ui/ui_screensaver.h"
 
-#include <dirent.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -27,14 +25,8 @@
 #define SCREENSAVER_ACCENT_HEX 0xFFFFFF
 #define SCREENSAVER_POLL_MS 250
 
-/* Wallpaper is uploaded from the web editor and stored on the SD card. */
-#define SCREENSAVER_WALLPAPER_DIR  "/sdcard/bg"
+/* The user's fixed wallpaper, stored on the SD card. */
 #define SCREENSAVER_WALLPAPER_PATH "/sdcard/bg/screensaver.png"
-
-/* When more than one wallpaper is found on the SD card the screensaver
- * rotates through them as a slideshow. */
-#define SCREENSAVER_SLIDESHOW_MS 12000
-#define SCREENSAVER_MAX_CANDIDATES 16
 
 /* Time before which we consider NTP to be unsynchronized (2021-01-01 UTC). */
 #define SCREENSAVER_SYNCED_EPOCH 1609459200
@@ -42,7 +34,6 @@
 typedef struct {
     lv_obj_t *root;
     lv_obj_t *clock_label;
-    lv_obj_t *wallpaper_img;
     lv_timer_t *timer;
     lv_image_dsc_t wallpaper_dsc;
     bool wallpaper_owned;
@@ -51,12 +42,6 @@ typedef struct {
      * decoded RGB565 across screensaver show/hide cycles and only re-decode
      * when the resolved candidate changes. */
     char wallpaper_path[APP_MAX_IMAGE_PATH_LEN];
-    /* Slideshow rotation state: every wallpaper discovered on the SD card,
-     * the currently shown index, and the timestamp of the next rotation. */
-    char slideshow_paths[SCREENSAVER_MAX_CANDIDATES][APP_MAX_IMAGE_PATH_LEN];
-    int slideshow_count;
-    int slideshow_index;
-    uint32_t slideshow_next_ms;
 } screensaver_state_t;
 
 static screensaver_state_t s_ss = {0};
@@ -78,7 +63,6 @@ static void screensaver_hide(void)
     }
     s_ss.root = NULL;
     s_ss.clock_label = NULL;
-    s_ss.wallpaper_img = NULL;
     s_ss.visible = false;
     /* Keep the decoded wallpaper so the next show doesn't have to re-run the
      * (expensive) PNG decode while camera/HA may have consumed PSRAM. */
@@ -109,197 +93,46 @@ static void screensaver_touch_cb(lv_event_t *event)
     screensaver_hide();
 }
 
-/* Case-insensitive check whether a file name carries a wallpaper extension
- * we can decode (PNG or JPEG). */
-static bool screensaver_is_wallpaper_name(const char *name)
-{
-    if (name == NULL) {
-        return false;
-    }
-    size_t n = strlen(name);
-    if (n < 5) {
-        return false;
-    }
-    const char *ext = name + n - 4;
-    if (strcasecmp(ext, ".png") == 0) {
-        return true;
-    }
-    if (n >= 5 && strcasecmp(ext, ".jpg") == 0) {
-        return true;
-    }
-    if (n >= 6 && strcasecmp(name + n - 5, ".jpeg") == 0) {
-        return true;
-    }
-    return false;
-}
-
-/* Build the ordered list of wallpaper candidates for the screensaver:
- *   1. the user's explicit selection,
- *   2. the default /sdcard/bg/screensaver.png when present,
- *   3. every other .png in /sdcard/bg/, sorted alphabetically for a
- *      deterministic fallback.
+/* Decode (or reuse) the screensaver wallpaper into s_ss.wallpaper_dsc.
+ * The wallpaper is ALWAYS the fixed /sdcard/bg/screensaver.png (the user's
+ * own image). There is intentionally NO auto-discovery fallback: other PNGs
+ * on the SD card are tile backgrounds, not wallpapers, and must never be
+ * shown by the screensaver. If screensaver.png is missing or fails to decode,
+ * the screensaver falls back to the embedded "BETTA" label.
  *
- * Each entry is a full /sdcard/bg/... path and duplicates are dropped. The
- * list lets the caller try candidates in order until one actually decodes
- * (e.g. skip an oversized screensaver.png and use the next PNG on the card),
- * so the screensaver works right after a fresh flash with no manual upload.
- * Returns the number of candidates written to `paths`. */
-static int screensaver_collect_candidates(char paths[][APP_MAX_IMAGE_PATH_LEN],
-                                          int max_candidates,
-                                          const display_power_config_t *cfg)
-{
-    int count = 0;
-
-    if (cfg->screensaver_wallpaper[0] != '\0' && count < max_candidates) {
-        (void)snprintf(paths[count], APP_MAX_IMAGE_PATH_LEN, "%s/%s",
-                       SCREENSAVER_WALLPAPER_DIR, cfg->screensaver_wallpaper);
-        count++;
-    }
-
-    struct stat st;
-    if (count < max_candidates &&
-        stat(SCREENSAVER_WALLPAPER_PATH, &st) == 0 && S_ISREG(st.st_mode)) {
-        bool dup = false;
-        for (int i = 0; i < count; i++) {
-            if (strcmp(paths[i], SCREENSAVER_WALLPAPER_PATH) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
-            strlcpy(paths[count], SCREENSAVER_WALLPAPER_PATH, APP_MAX_IMAGE_PATH_LEN);
-            count++;
-        }
-    }
-
-    /* Remaining candidates start here; sorted below for a stable fallback. */
-    int first_discovered = count;
-
-    DIR *d = opendir(SCREENSAVER_WALLPAPER_DIR);
-    if (d != NULL) {
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL && count < max_candidates) {
-            const char *name = e->d_name;
-            if (!screensaver_is_wallpaper_name(name)) {
-                continue;
-            }
-            if (e->d_type == DT_DIR) {
-                continue;
-            }
-            char full[288]; /* dir + '/' + NAME_MAX + NUL */
-            (void)snprintf(full, sizeof(full), "%s/%s", SCREENSAVER_WALLPAPER_DIR, name);
-            if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
-                continue;
-            }
-            bool dup = false;
-            for (int i = 0; i < count; i++) {
-                if (strcmp(paths[i], full) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) {
-                continue;
-            }
-            strlcpy(paths[count], full, APP_MAX_IMAGE_PATH_LEN);
-            count++;
-        }
-        closedir(d);
-    }
-
-    /* Sort only the discovered tail; explicit selection and screensaver.png
-     * keep their priority. */
-    for (int i = first_discovered; i < count; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (strcmp(paths[j], paths[i]) < 0) {
-                char tmp[APP_MAX_IMAGE_PATH_LEN];
-                strlcpy(tmp, paths[i], sizeof(tmp));
-                strlcpy(paths[i], paths[j], APP_MAX_IMAGE_PATH_LEN);
-                strlcpy(paths[j], tmp, APP_MAX_IMAGE_PATH_LEN);
-            }
-        }
-    }
-
-    return count;
-}
-
-/* Decode (or reuse) the best available wallpaper into s_ss.wallpaper_dsc.
  * Returns true when a decoded RGB565 image is available in s_ss.wallpaper_dsc.
- * Called once at init (while PSRAM is still plentiful, before the camera and
- * HA tasks allocate) and again from screensaver_show() when the cached image
- * is missing or the resolved candidate changed. */
-static bool screensaver_load_wallpaper(const display_power_config_t *cfg)
+ * Called once at boot via ui_screensaver_preload() (while PSRAM is still
+ * plentiful, before layout tiles/camera/HA consume it) and again from
+ * screensaver_show() when the cached image is missing. */
+static bool screensaver_load_wallpaper(void)
 {
-    char wallpaper_paths[SCREENSAVER_MAX_CANDIDATES][APP_MAX_IMAGE_PATH_LEN] = {{0}};
-    int candidate_count = screensaver_collect_candidates(wallpaper_paths,
-                                                         SCREENSAVER_MAX_CANDIDATES, cfg);
-    if (candidate_count == 0) {
-        s_ss.slideshow_count = 0;
-        ESP_LOGI(TAG_UI, "Screensaver wallpaper: none found on SD card");
+    struct stat st;
+    if (stat(SCREENSAVER_WALLPAPER_PATH, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ESP_LOGI(TAG_UI, "Screensaver wallpaper: %s not found",
+                 SCREENSAVER_WALLPAPER_PATH);
         return false;
     }
 
-    /* Keep the ordered candidate list so the slideshow can rotate through it. */
-    s_ss.slideshow_count = candidate_count;
-    for (int i = 0; i < candidate_count; i++) {
-        strlcpy(s_ss.slideshow_paths[i], wallpaper_paths[i],
-                sizeof(s_ss.slideshow_paths[i]));
-    }
-
-    /* Reuse the cached decode when the preferred candidate hasn't changed. */
+    /* Reuse the cached decode across show/hide cycles. */
     if (s_ss.wallpaper_owned && s_ss.wallpaper_dsc.data != NULL &&
         s_ss.wallpaper_path[0] != '\0' &&
-        strcmp(s_ss.wallpaper_path, wallpaper_paths[0]) == 0) {
-        s_ss.slideshow_index = 0;
+        strcmp(s_ss.wallpaper_path, SCREENSAVER_WALLPAPER_PATH) == 0) {
         return true;
     }
 
     screensaver_release_wallpaper();
 
-    for (int i = 0; i < candidate_count; i++) {
-        ESP_LOGI(TAG_UI, "Screensaver wallpaper: trying %s", wallpaper_paths[i]);
-        if (!ui_image_load_file(wallpaper_paths[i], APP_SCREEN_WIDTH,
+    ESP_LOGI(TAG_UI, "Screensaver wallpaper: decoding %s",
+             SCREENSAVER_WALLPAPER_PATH);
+    if (!ui_image_load_png_file(SCREENSAVER_WALLPAPER_PATH, APP_SCREEN_WIDTH,
                                 APP_SCREEN_HEIGHT, &s_ss.wallpaper_dsc)) {
-            continue;
-        }
-        strlcpy(s_ss.wallpaper_path, wallpaper_paths[i], sizeof(s_ss.wallpaper_path));
-        s_ss.wallpaper_owned = true;
-        s_ss.slideshow_index = i;
-        return true;
+        ESP_LOGW(TAG_UI, "Screensaver wallpaper: decode failed, using fallback");
+        return false;
     }
-    return false;
-}
-
-/* Advance to the next wallpaper in the slideshow. Decodes the next image
- * first (so a failure never blanks the screen), then swaps it in place of the
- * current one. The image widget keeps pointing at &s_ss.wallpaper_dsc, so only
- * a redraw invalidation is needed after the underlying pixels change. */
-static void screensaver_rotate_wallpaper(void)
-{
-    if (s_ss.slideshow_count <= 1 || s_ss.wallpaper_img == NULL) {
-        return;
-    }
-
-    int next = (s_ss.slideshow_index + 1) % s_ss.slideshow_count;
-    const char *path = s_ss.slideshow_paths[next];
-
-    lv_image_dsc_t next_dsc = {0};
-    if (!ui_image_load_file(path, APP_SCREEN_WIDTH, APP_SCREEN_HEIGHT, &next_dsc)) {
-        /* Keep the current wallpaper and retry a different one next cycle. */
-        s_ss.slideshow_index = next;
-        return;
-    }
-
-    if (s_ss.wallpaper_owned && s_ss.wallpaper_dsc.data != NULL) {
-        heap_caps_free((void *)s_ss.wallpaper_dsc.data);
-    }
-    s_ss.wallpaper_dsc = next_dsc;
+    strlcpy(s_ss.wallpaper_path, SCREENSAVER_WALLPAPER_PATH,
+            sizeof(s_ss.wallpaper_path));
     s_ss.wallpaper_owned = true;
-    strlcpy(s_ss.wallpaper_path, path, sizeof(s_ss.wallpaper_path));
-    s_ss.slideshow_index = next;
-
-    lv_image_set_src(s_ss.wallpaper_img, &s_ss.wallpaper_dsc);
-    lv_obj_invalidate(s_ss.wallpaper_img);
+    return true;
 }
 
 static void screensaver_show(void)
@@ -322,23 +155,19 @@ static void screensaver_show(void)
     display_power_config_t cfg;
     display_get_power_config(&cfg);
 
-    /* Prefer the user-selected wallpaper from the SD card; when none was
-     * chosen (fresh flash) auto-discover a PNG already on the card so the
-     * screensaver works right after flashing without any manual upload or
-     * selection. Fall back to the compile-time embedded emblem when the
-     * card/file is missing.
+    /* Show the user's fixed wallpaper (/sdcard/bg/screensaver.png). There is
+     * intentionally no fallback to other SD files; if the image is missing or
+     * failed to decode, fall back to the embedded "BETTA" label.
      *
      * IMPORTANT: the image widget stores the dsc pointer (LV_IMAGE_SRC_VARIABLE)
      * without copying it, so the decoded image lives in the persistent
      * s_ss.wallpaper_dsc for as long as the screensaver may need it. */
-    bool have_image = screensaver_load_wallpaper(&cfg);
+    bool have_image = screensaver_load_wallpaper();
     if (have_image) {
         lv_obj_t *img = lv_image_create(root);
         lv_image_set_src(img, &s_ss.wallpaper_dsc);
         lv_obj_set_size(img, APP_SCREEN_WIDTH, APP_SCREEN_HEIGHT);
         lv_obj_set_pos(img, 0, 0);
-        s_ss.wallpaper_img = img;
-        s_ss.slideshow_next_ms = lv_tick_get() + SCREENSAVER_SLIDESHOW_MS;
     } else {
         lv_obj_t *fallback = lv_label_create(root);
         lv_label_set_text(fallback, "BETTA");
@@ -378,11 +207,20 @@ static void screensaver_timer_cb(lv_timer_t *timer)
         screensaver_hide();
     } else if (active) {
         screensaver_update_clock();
-        if (s_ss.slideshow_count > 1 && s_ss.slideshow_next_ms != 0 &&
-            (int32_t)(lv_tick_get() - s_ss.slideshow_next_ms) >= 0) {
-            screensaver_rotate_wallpaper();
-            s_ss.slideshow_next_ms = lv_tick_get() + SCREENSAVER_SLIDESHOW_MS;
-        }
+    }
+}
+
+/* Decode the screensaver wallpaper early in boot, before layout tiles, the
+ * camera and HA tasks consume PSRAM. Call this right after display_init()
+ * (and the boot splash), when PSRAM is still at its post-boot maximum — the
+ * same 2.3MB screensaver.png decode that fails later under load fits here.
+ * The decoded RGB565 is cached in s_ss for every later screensaver cycle.
+ * Safe to call repeatedly: the cached image is reused when already decoded. */
+void ui_screensaver_preload(void)
+{
+    if (display_lock(5000)) {
+        (void)screensaver_load_wallpaper();
+        display_unlock();
     }
 }
 
@@ -400,17 +238,9 @@ esp_err_t ui_screensaver_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Decode the wallpaper now, while boot has not yet started the camera and
-     * HA tasks: PSRAM is still at its post-boot maximum, so a large PNG fits
-     * here even though the same decode would fail once the panel is under
-     * load. The decoded RGB565 stays cached for every later screensaver
-     * cycle. */
-    display_power_config_t cfg;
-    display_get_power_config(&cfg);
-    if (display_lock(5000)) {
-        (void)screensaver_load_wallpaper(&cfg);
-        display_unlock();
-    }
+    /* Safety net: if preload was not called (unusual boot path), try to
+     * decode now. This is a no-op when the wallpaper is already cached. */
+    ui_screensaver_preload();
 
     ESP_LOGI(TAG_UI, "Graphical screensaver initialized");
     return ESP_OK;

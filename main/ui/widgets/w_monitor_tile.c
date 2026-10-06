@@ -9,6 +9,7 @@
 #include "ui/ui_widget_factory.h"
 
 #include <stdbool.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,9 +61,11 @@ typedef enum {
     MONITOR_STYLE_ARC_SEMI,
     MONITOR_STYLE_GAUGE,
     MONITOR_STYLE_BARS,
+    MONITOR_STYLE_HUD,
 } monitor_style_t;
 
 #define MONITOR_BAR_COUNT 8
+#define MONITOR_TICK_COUNT 21
 
 typedef enum {
     MONITOR_OPENING_LEFT = 0,
@@ -84,6 +87,9 @@ typedef struct {
     lv_obj_t *value_label;
     lv_obj_t *bar;
     lv_obj_t *arc;
+    lv_obj_t *glow_arc;
+    lv_obj_t *ticks[MONITOR_TICK_COUNT];
+    lv_obj_t *unit_label;
     lv_obj_t *needle;
     lv_obj_t *bars[MONITOR_BAR_COUNT];
     monitor_style_t style;
@@ -91,6 +97,8 @@ typedef struct {
     int min;
     int max;
     bool unavailable;
+    int16_t arc_value;
+    int32_t needle_rot;
     uint8_t sub_count;
     monitor_sub_t subs[APP_MAX_MONITOR_SUBS];
 } monitor_ctx_t;
@@ -168,6 +176,9 @@ static monitor_style_t monitor_style_from_variant(const char *variant)
     if (strcmp(variant, "bars") == 0 || strcmp(variant, "signal_bars") == 0) {
         return MONITOR_STYLE_BARS;
     }
+    if (strcmp(variant, "hud") == 0 || strcmp(variant, "ring") == 0) {
+        return MONITOR_STYLE_HUD;
+    }
     return MONITOR_STYLE_DEFAULT;
 }
 
@@ -189,7 +200,7 @@ static monitor_opening_t monitor_opening_from_variant(const char *variant)
 
 static void monitor_arc_angles(monitor_style_t style, monitor_opening_t opening, uint16_t *bg_start, uint16_t *bg_end)
 {
-    if (style == MONITOR_STYLE_ARC || style == MONITOR_STYLE_GAUGE) {
+    if (style == MONITOR_STYLE_ARC || style == MONITOR_STYLE_GAUGE || style == MONITOR_STYLE_HUD) {
         *bg_start = 135;
         *bg_end = 45;
         return;
@@ -289,6 +300,58 @@ static void monitor_set_value_text(monitor_ctx_t *ctx, const char *text)
     lv_label_set_text(ctx->value_label, (text != NULL && text[0] != '\0') ? text : "--");
 }
 
+static void monitor_anim_arc_cb(void *var, int32_t v)
+{
+    lv_arc_set_value((lv_obj_t *)var, (int16_t)v);
+}
+
+static void monitor_anim_needle_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_transform_rotation((lv_obj_t *)var, v, LV_PART_MAIN);
+}
+
+static void monitor_animate_to(monitor_ctx_t *ctx, int16_t pct)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->arc != NULL && ctx->arc_value != pct) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, ctx->arc);
+        lv_anim_set_exec_cb(&a, monitor_anim_arc_cb);
+        lv_anim_set_values(&a, ctx->arc_value, pct);
+        lv_anim_set_time(&a, 450);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+        if (ctx->glow_arc != NULL) {
+            lv_anim_t g;
+            lv_anim_init(&g);
+            lv_anim_set_var(&g, ctx->glow_arc);
+            lv_anim_set_exec_cb(&g, monitor_anim_arc_cb);
+            lv_anim_set_values(&g, ctx->arc_value, pct);
+            lv_anim_set_time(&g, 450);
+            lv_anim_set_path_cb(&g, lv_anim_path_ease_out);
+            lv_anim_start(&g);
+        }
+        ctx->arc_value = pct;
+    }
+    if (ctx->needle != NULL) {
+        int32_t target = 1350 + (int32_t)pct * 27;
+        if (ctx->needle_rot != target) {
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, ctx->needle);
+            lv_anim_set_exec_cb(&a, monitor_anim_needle_cb);
+            lv_anim_set_values(&a, ctx->needle_rot, target);
+            lv_anim_set_time(&a, 450);
+            lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+            lv_anim_start(&a);
+            ctx->needle_rot = target;
+        }
+    }
+}
+
 static lv_color_t monitor_threshold_color(int pct)
 {
     if (pct >= 85) {
@@ -298,6 +361,28 @@ static lv_color_t monitor_threshold_color(int pct)
         return lv_color_hex(0xF0A030);
     }
     return lv_color_hex(APP_UI_COLOR_STATE_ON);
+}
+
+/* Smooth cyan -> green -> amber -> red gradient for the HUD ring, instead of
+ * three hard thresholds.  The stop colours match the neon theme: the ring reads
+ * as "cool = fine, warm = busy, red = critical" without a visible step. */
+static lv_color_t monitor_hud_gradient(int pct)
+{
+    const lv_color_t c_cool = lv_color_hex(APP_UI_COLOR_STATE_ON);   /* neon cyan */
+    const lv_color_t c_ok   = lv_color_hex(0x3DF0A4);                /* mint green */
+    const lv_color_t c_warm = lv_color_hex(0xF0A030);                /* amber */
+    const lv_color_t c_hot  = lv_color_hex(APP_UI_COLOR_ERROR);      /* red */
+
+    if (pct <= 50) {
+        return lv_color_mix(c_cool, c_ok, (uint8_t)(pct * 255 / 50));
+    }
+    if (pct <= 80) {
+        return lv_color_mix(c_ok, c_warm, (uint8_t)((pct - 50) * 255 / 30));
+    }
+    if (pct >= 100) {
+        return c_hot;
+    }
+    return lv_color_mix(c_warm, c_hot, (uint8_t)((pct - 80) * 255 / 20));
 }
 
 static int monitor_sub_area_height(const monitor_ctx_t *ctx)
@@ -390,33 +475,107 @@ static void monitor_apply_layout(monitor_ctx_t *ctx)
             lv_obj_set_size(b, bar_w, bars_h);
             lv_obj_set_pos(b, start_x + i * (bar_w + gap), bars_y);
         }
+    } else if (ctx->style == MONITOR_STYLE_HUD) {
+        /* Neon ring: indicator + glow arcs share one diameter, a dotted scale
+         * sits inside the ring and the value/unit are stacked in the middle. */
+        lv_coord_t diam = (cw < main_h) ? cw : main_h;
+        diam -= 10;
+        if (diam < 60) {
+            diam = 60;
+        }
+        lv_coord_t cx = cw / 2;
+        lv_coord_t cy = main_y + main_h / 2;
+        lv_coord_t vh = (diam >= 170) ? 48 : 36;
+
+        lv_obj_set_style_text_align(ctx->value_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(ctx->value_label,
+            (diam >= 170) ? MONITOR_VALUE_FONT_LARGE : MONITOR_VALUE_FONT_MEDIUM, LV_PART_MAIN);
+        lv_obj_set_size(ctx->value_label, diam, vh);
+        lv_obj_set_pos(ctx->value_label, cx - diam / 2, cy - vh + 2);
+
+        if (ctx->unit_label != NULL) {
+            lv_obj_set_style_text_font(ctx->unit_label, APP_FONT_TEXT_16, LV_PART_MAIN);
+            lv_obj_set_size(ctx->unit_label, diam, 20);
+            lv_obj_set_pos(ctx->unit_label, cx - diam / 2, cy + 4);
+        }
+        if (ctx->glow_arc != NULL) {
+            lv_obj_set_size(ctx->glow_arc, diam, diam);
+            lv_obj_set_pos(ctx->glow_arc, cx - diam / 2, cy - diam / 2);
+        }
+        if (ctx->arc != NULL) {
+            lv_obj_set_size(ctx->arc, diam, diam);
+            lv_obj_set_pos(ctx->arc, cx - diam / 2, cy - diam / 2);
+        }
+
+        lv_coord_t tick_r = diam / 2 - 26;
+        if (tick_r < 10) {
+            tick_r = 10;
+        }
+        for (int i = 0; i < MONITOR_TICK_COUNT; i++) {
+            lv_obj_t *t = ctx->ticks[i];
+            if (t == NULL) {
+                continue;
+            }
+            float ang = (float)(135 + i * (270 / (MONITOR_TICK_COUNT - 1))) * 3.14159265f / 180.0f;
+            lv_obj_set_size(t, 5, 5);
+            lv_obj_set_style_radius(t, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+            lv_obj_set_pos(t,
+                cx + (lv_coord_t)(cosf(ang) * (float)tick_r) - 2,
+                cy + (lv_coord_t)(sinf(ang) * (float)tick_r) - 2);
+        }
     } else {
         /* arc / arc_semi / gauge */
         lv_coord_t arc_diam = (cw < main_h) ? cw : main_h;
         if (arc_diam < 40) {
             arc_diam = 40;
         }
-        lv_obj_set_style_text_font(
-            ctx->value_label,
-            (arc_diam >= 150) ? MONITOR_VALUE_FONT_LARGE :
-                ((arc_diam >= 90) ? MONITOR_VALUE_FONT_MEDIUM : MONITOR_VALUE_FONT_SMALL),
-            LV_PART_MAIN);
         lv_obj_set_style_text_align(ctx->value_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_set_size(ctx->value_label, arc_diam, arc_diam);
-        lv_obj_set_pos(ctx->value_label, (cw - arc_diam) / 2, main_y + (main_h - arc_diam) / 2);
-        if (ctx->arc != NULL) {
-            lv_obj_set_size(ctx->arc, arc_diam, arc_diam);
-            lv_obj_set_pos(ctx->arc, (cw - arc_diam) / 2, main_y + (main_h - arc_diam) / 2);
-        }
-        if (ctx->needle != NULL) {
-            lv_coord_t needle_len = arc_diam / 2 - 8;
-            if (needle_len < 12) {
-                needle_len = 12;
+        if (ctx->style == MONITOR_STYLE_GAUGE) {
+            /* Speedometer layout: the needle sweeps the upper area, the value
+             * sits in a dedicated band below the pivot so they never overlap. */
+            lv_coord_t value_band = 34;
+            lv_coord_t avail_h = main_h - value_band;
+            if (avail_h < 40) {
+                avail_h = 40;
             }
-            lv_obj_set_size(ctx->needle, needle_len, 3);
-            lv_obj_set_style_transform_pivot_x(ctx->needle, 0, LV_PART_MAIN);
-            lv_obj_set_style_transform_pivot_y(ctx->needle, 1, LV_PART_MAIN);
-            lv_obj_set_pos(ctx->needle, cw / 2, main_y + main_h / 2 - 1);
+            if (arc_diam > avail_h) {
+                arc_diam = avail_h;
+            }
+            if (arc_diam < 40) {
+                arc_diam = 40;
+            }
+            lv_obj_set_style_text_font(
+                ctx->value_label,
+                (arc_diam >= 150) ? MONITOR_VALUE_FONT_MEDIUM : MONITOR_VALUE_FONT_SMALL,
+                LV_PART_MAIN);
+            lv_obj_set_size(ctx->value_label, cw, value_band);
+            lv_obj_set_pos(ctx->value_label, 0, main_y + main_h - value_band);
+            if (ctx->arc != NULL) {
+                lv_obj_set_size(ctx->arc, arc_diam, arc_diam);
+                lv_obj_set_pos(ctx->arc, (cw - arc_diam) / 2, main_y + (avail_h - arc_diam) / 2);
+            }
+            if (ctx->needle != NULL) {
+                lv_coord_t needle_len = arc_diam / 2 - 8;
+                if (needle_len < 12) {
+                    needle_len = 12;
+                }
+                lv_obj_set_size(ctx->needle, needle_len, 3);
+                lv_obj_set_style_transform_pivot_x(ctx->needle, 0, LV_PART_MAIN);
+                lv_obj_set_style_transform_pivot_y(ctx->needle, 1, LV_PART_MAIN);
+                lv_obj_set_pos(ctx->needle, cw / 2, main_y + (avail_h - arc_diam) / 2 + arc_diam / 2 - 1);
+            }
+        } else {
+            lv_obj_set_style_text_font(
+                ctx->value_label,
+                (arc_diam >= 150) ? MONITOR_VALUE_FONT_LARGE :
+                    ((arc_diam >= 90) ? MONITOR_VALUE_FONT_MEDIUM : MONITOR_VALUE_FONT_SMALL),
+                LV_PART_MAIN);
+            lv_obj_set_size(ctx->value_label, arc_diam, arc_diam);
+            lv_obj_set_pos(ctx->value_label, (cw - arc_diam) / 2, main_y + (main_h - arc_diam) / 2);
+            if (ctx->arc != NULL) {
+                lv_obj_set_size(ctx->arc, arc_diam, arc_diam);
+                lv_obj_set_pos(ctx->arc, (cw - arc_diam) / 2, main_y + (main_h - arc_diam) / 2);
+            }
         }
     }
 
@@ -471,10 +630,22 @@ static void monitor_apply_unavailable(monitor_ctx_t *ctx)
         lv_bar_set_value(ctx->bar, 0, LV_ANIM_OFF);
     }
     if (ctx->arc != NULL) {
-        lv_arc_set_value(ctx->arc, 0);
+        if (ctx->style == MONITOR_STYLE_GAUGE || ctx->style == MONITOR_STYLE_HUD) {
+            monitor_animate_to(ctx, 0);
+        } else {
+            lv_arc_set_value(ctx->arc, 0);
+        }
     }
-    if (ctx->needle != NULL) {
-        lv_obj_set_style_transform_rotation(ctx->needle, 1350, LV_PART_MAIN);
+    if (ctx->glow_arc != NULL) {
+        lv_arc_set_value(ctx->glow_arc, 0);
+    }
+    if (ctx->unit_label != NULL) {
+        lv_label_set_text(ctx->unit_label, "");
+    }
+    for (int i = 0; i < MONITOR_TICK_COUNT; i++) {
+        if (ctx->ticks[i] != NULL) {
+            lv_obj_set_style_bg_color(ctx->ticks[i], lv_color_hex(APP_UI_COLOR_CARD_BORDER), LV_PART_MAIN);
+        }
     }
     for (int i = 0; i < MONITOR_BAR_COUNT; i++) {
         if (ctx->bars[i] != NULL) {
@@ -554,6 +725,7 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
 
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, def->title[0] ? def->title : def->id);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(title, theme_default_color_text_muted(), LV_PART_MAIN);
 
     lv_obj_t *dot = lv_obj_create(card);
@@ -566,17 +738,23 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
 
     lv_obj_t *value = lv_label_create(card);
     lv_label_set_text(value, "--");
+    lv_label_set_long_mode(value, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_color(value, theme_default_color_text_primary(), LV_PART_MAIN);
 
     monitor_style_t style = monitor_style_from_variant(def->style_variant);
     monitor_opening_t opening = monitor_opening_from_variant(def->arc_opening);
     lv_obj_t *bar = NULL;
     lv_obj_t *arc = NULL;
+    lv_obj_t *glow_arc = NULL;
+    lv_obj_t *unit_label = NULL;
+    lv_obj_t *ticks[MONITOR_TICK_COUNT] = {0};
     lv_obj_t *needle = NULL;
     lv_obj_t *bars[MONITOR_BAR_COUNT] = {0};
 
     if (style == MONITOR_STYLE_PERCENT) {
         bar = lv_bar_create(card);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
         lv_bar_set_range(bar, 0, 100);
         lv_bar_set_value(bar, 0, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(bar, lv_color_hex(APP_UI_COLOR_CARD_BORDER), LV_PART_MAIN);
@@ -587,6 +765,8 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
         lv_obj_set_style_radius(bar, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
     } else if (style == MONITOR_STYLE_ARC || style == MONITOR_STYLE_ARC_SEMI || style == MONITOR_STYLE_GAUGE) {
         arc = lv_arc_create(card);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_SCROLLABLE);
         lv_arc_set_mode(arc, LV_ARC_MODE_NORMAL);
         lv_arc_set_range(arc, 0, 100);
         lv_arc_set_value(arc, 0);
@@ -609,12 +789,70 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
         if (style == MONITOR_STYLE_GAUGE) {
             needle = lv_obj_create(card);
             lv_obj_clear_flag(needle, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(needle, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_style_pad_all(needle, 0, LV_PART_MAIN);
             lv_obj_set_style_border_width(needle, 0, LV_PART_MAIN);
             lv_obj_set_style_radius(needle, LV_RADIUS_CIRCLE, LV_PART_MAIN);
             lv_obj_set_style_bg_color(needle, lv_color_hex(APP_UI_COLOR_STATE_ON), LV_PART_MAIN);
             lv_obj_set_style_bg_opa(needle, LV_OPA_COVER, LV_PART_MAIN);
         }
+    } else if (style == MONITOR_STYLE_HUD) {
+        /* Neon HUD ring: a wide translucent glow arc behind a crisp indicator
+         * arc, a dotted scale inside the ring and a big centred value with a
+         * small unit caption underneath. */
+        glow_arc = lv_arc_create(card);
+        lv_obj_clear_flag(glow_arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(glow_arc, LV_OBJ_FLAG_SCROLLABLE);
+        lv_arc_set_mode(glow_arc, LV_ARC_MODE_NORMAL);
+        lv_arc_set_range(glow_arc, 0, 100);
+        lv_arc_set_value(glow_arc, 0);
+        lv_arc_set_rotation(glow_arc, 0);
+        lv_arc_set_bg_angles(glow_arc, 135, 45);
+        lv_obj_set_style_arc_color(glow_arc, lv_color_hex(APP_UI_COLOR_CARD_BORDER), LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(glow_arc, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(glow_arc, 12, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(glow_arc, true, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(glow_arc, lv_color_hex(0x4FE3FF), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(glow_arc, LV_OPA_20, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_width(glow_arc, 30, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(glow_arc, true, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(glow_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(glow_arc, 0, LV_PART_KNOB);
+
+        arc = lv_arc_create(card);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_SCROLLABLE);
+        lv_arc_set_mode(arc, LV_ARC_MODE_NORMAL);
+        lv_arc_set_range(arc, 0, 100);
+        lv_arc_set_value(arc, 0);
+        lv_arc_set_rotation(arc, 0);
+        lv_arc_set_bg_angles(arc, 135, 45);
+        lv_obj_set_style_arc_opa(arc, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(arc, lv_color_hex(0x4FE3FF), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_width(arc, 12, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
+
+        for (int i = 0; i < MONITOR_TICK_COUNT; i++) {
+            lv_obj_t *t = lv_obj_create(card);
+            lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(t, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_pad_all(t, 0, LV_PART_MAIN);
+            lv_obj_set_style_border_width(t, 0, LV_PART_MAIN);
+            lv_obj_set_style_radius(t, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(t, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(t, lv_color_hex(APP_UI_COLOR_CARD_BORDER), LV_PART_MAIN);
+            ticks[i] = t;
+        }
+
+        unit_label = lv_label_create(card);
+        lv_label_set_text(unit_label, "");
+        lv_label_set_long_mode(unit_label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_color(unit_label, theme_default_color_text_muted(), LV_PART_MAIN);
+        lv_obj_set_style_text_font(unit_label, APP_FONT_TEXT_14, LV_PART_MAIN);
+        lv_obj_set_style_text_align(unit_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     } else if (style == MONITOR_STYLE_BARS) {
         for (int i = 0; i < MONITOR_BAR_COUNT; i++) {
             bars[i] = lv_obj_create(card);
@@ -639,6 +877,9 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
     ctx->value_label = value;
     ctx->bar = bar;
     ctx->arc = arc;
+    ctx->glow_arc = glow_arc;
+    ctx->unit_label = unit_label;
+    memcpy(ctx->ticks, ticks, sizeof(ticks));
     ctx->needle = needle;
     memcpy(ctx->bars, bars, sizeof(bars));
     ctx->style = style;
@@ -646,6 +887,8 @@ esp_err_t w_monitor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui
     ctx->min = def->sensor_min;
     ctx->max = def->sensor_max;
     ctx->unavailable = false;
+    ctx->arc_value = 0;
+    ctx->needle_rot = 1350;
     ctx->sub_count = (uint8_t)monitor_parse_subs(def->extra_entity_ids, ctx->subs, APP_MAX_MONITOR_SUBS);
 
     for (uint8_t i = 0; i < ctx->sub_count; i++) {
@@ -708,19 +951,37 @@ static void monitor_update_primary(monitor_ctx_t *ctx, const ha_state_t *state)
                 }
             }
             int pct = monitor_compute_percent(fvalue, unit, ctx->min, ctx->max);
-            lv_color_t pct_color = monitor_threshold_color(pct);
+            lv_color_t pct_color = (ctx->style == MONITOR_STYLE_HUD)
+                ? monitor_hud_gradient(pct)
+                : monitor_threshold_color(pct);
             if (ctx->bar != NULL) {
                 lv_bar_set_value(ctx->bar, pct, LV_ANIM_ON);
                 lv_obj_set_style_bg_color(ctx->bar, pct_color, LV_PART_INDICATOR);
             }
             if (ctx->arc != NULL) {
-                lv_arc_set_value(ctx->arc, pct);
-                if (ctx->style == MONITOR_STYLE_GAUGE) {
+                if (ctx->style == MONITOR_STYLE_GAUGE || ctx->style == MONITOR_STYLE_HUD) {
                     lv_obj_set_style_arc_color(ctx->arc, pct_color, LV_PART_INDICATOR);
+                    monitor_animate_to(ctx, (int16_t)pct);
+                } else {
+                    lv_arc_set_value(ctx->arc, pct);
+                }
+            }
+            if (ctx->glow_arc != NULL) {
+                lv_obj_set_style_arc_color(ctx->glow_arc, pct_color, LV_PART_INDICATOR);
+            }
+            if (ctx->style == MONITOR_STYLE_HUD) {
+                if (ctx->unit_label != NULL) {
+                    lv_label_set_text(ctx->unit_label, unit != NULL ? unit : "");
+                }
+                int filled = (pct * (MONITOR_TICK_COUNT - 1) + 50) / 100;
+                for (int i = 0; i < MONITOR_TICK_COUNT; i++) {
+                    if (ctx->ticks[i] != NULL) {
+                        lv_obj_set_style_bg_color(ctx->ticks[i],
+                            (i <= filled) ? pct_color : lv_color_hex(APP_UI_COLOR_CARD_BORDER), LV_PART_MAIN);
+                    }
                 }
             }
             if (ctx->needle != NULL) {
-                lv_obj_set_style_transform_rotation(ctx->needle, 1350 + pct * 27, LV_PART_MAIN);
                 lv_obj_set_style_bg_color(ctx->needle, pct_color, LV_PART_MAIN);
             }
             if (ctx->style == MONITOR_STYLE_BARS) {

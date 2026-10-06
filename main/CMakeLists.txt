@@ -94,6 +94,7 @@ set(MAIN_SRCS
         "api/api_ha_diagnostics.c"
         "api/api_system_log.c"
         "diag/system_log.c"
+        "diag/storage_guard.c"
         ${PANEL_DRIVER_SRCS}
         "ha/ha_client.c"
         "ha/ha_ws.c"

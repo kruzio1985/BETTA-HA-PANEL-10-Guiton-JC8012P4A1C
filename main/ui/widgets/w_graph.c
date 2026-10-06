@@ -21,6 +21,8 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "diag/storage_guard.h"
+#include "drivers/board_extras_panel10jc.h"
 #include "ui/fonts/app_text_fonts.h"
 #include "ui/ui_i18n.h"
 #include "ui/ui_memory.h"
@@ -64,7 +66,12 @@
 
 #define GRAPH_HISTORY_FILE_MAGIC 0x47525048U
 #define GRAPH_HISTORY_FILE_VERSION 1U
+/* Graph history is written to the microSD card when one is mounted: an
+ * internal-flash (LittleFS) rewrite every GRAPH_HISTORY_SAVE_INTERVAL_SEC parks
+ * both cores and stalls the MIPI-DSI scan-out, contributing to the full-screen
+ * flash.  LittleFS is only the fallback with no card inserted. */
 #define GRAPH_HISTORY_DIR "/littlefs/graphs"
+#define GRAPH_HISTORY_DIR_SD "/sdcard/graphs"
 #define GRAPH_HISTORY_PATH_MAX 128
 
 #define GRAPH_VALUE_SCALE 10
@@ -129,6 +136,7 @@ typedef struct {
 
 static const char *TAG = "w_graph";
 static bool s_graph_history_dir_ready = false;
+static const char *s_graph_history_dir_ready_for = NULL;
 static QueueHandle_t s_graph_persist_queue = NULL;
 static TaskHandle_t s_graph_persist_task = NULL;
 
@@ -381,21 +389,31 @@ static void graph_sanitize_widget_id(const char *widget_id, char *dst, size_t ds
     }
 }
 
+static const char *graph_history_dir(void)
+{
+    return sdcard_is_ready() ? GRAPH_HISTORY_DIR_SD : GRAPH_HISTORY_DIR;
+}
+
 static bool graph_ensure_history_dir(void)
 {
-    if (s_graph_history_dir_ready) {
+    const char *dir = graph_history_dir();
+
+    if (s_graph_history_dir_ready && s_graph_history_dir_ready_for == dir) {
         return true;
     }
+    s_graph_history_dir_ready = false;
 
     struct stat st = {0};
-    if (stat(GRAPH_HISTORY_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
         s_graph_history_dir_ready = true;
+        s_graph_history_dir_ready_for = dir;
         return true;
     }
 
-    (void)mkdir(GRAPH_HISTORY_DIR, 0775);
-    if (stat(GRAPH_HISTORY_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+    (void)mkdir(dir, 0775);
+    if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
         s_graph_history_dir_ready = true;
+        s_graph_history_dir_ready_for = dir;
         return true;
     }
 
@@ -415,7 +433,7 @@ static void graph_build_history_path(const char *widget_id, char *dst, size_t ds
 
     char safe_id[APP_MAX_WIDGET_ID_LEN] = {0};
     graph_sanitize_widget_id(widget_id, safe_id, sizeof(safe_id));
-    snprintf(dst, dst_size, "%s/%s.grph", GRAPH_HISTORY_DIR, safe_id);
+    snprintf(dst, dst_size, "%s/%s.grph", graph_history_dir(), safe_id);
 }
 
 static void graph_history_drop_oldest(w_graph_ctx_t *ctx, int drop_count)
@@ -512,10 +530,22 @@ static esp_err_t graph_history_load(w_graph_ctx_t *ctx)
     return ESP_OK;
 }
 
+static bool graph_path_on_sd(const char *history_path)
+{
+    return history_path != NULL && strncmp(history_path, GRAPH_HISTORY_DIR_SD, strlen(GRAPH_HISTORY_DIR_SD)) == 0;
+}
+
 static esp_err_t graph_history_save_buffer(const char *history_path, const graph_sample_t *history, int history_count)
 {
     if (history_path == NULL || history_path[0] == '\0' || history_count < 0 || history_count > GRAPH_HISTORY_MAX_SAMPLES) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    /* A LittleFS rewrite would park both cores and land right inside the MMU
+     * reprogramming window of esp_ota_end() -> rst:0x7.  SD writes are safe,
+     * so only the internal-flash path is held back (the caller retries). */
+    if (storage_guard_flash_writers_paused() && !graph_path_on_sd(history_path)) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     FILE *f = fopen(history_path, "wb");
@@ -561,6 +591,17 @@ static void graph_persist_task(void *arg)
         }
 
         esp_err_t err = graph_history_save_buffer(job->history_path, job->history, job->history_count);
+        if (err == ESP_ERR_INVALID_STATE) {
+            /* Flash writers are paused (esp_ota_end MMU window): keep the
+             * snapshot in RAM and retry shortly — the window lasts only a few
+             * hundred milliseconds. */
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (xQueueSend(s_graph_persist_queue, &job, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "graph persist queue full while gated, dropping snapshot");
+                free(job);
+            }
+            continue;
+        }
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "async history save failed (%s, count=%d): %s",
                 job->history_path, job->history_count, esp_err_to_name(err));

@@ -146,9 +146,10 @@ static esp_err_t write_public_settings_file(const runtime_settings_t *settings)
     cJSON *system = cJSON_CreateObject();
     cJSON *audio = cJSON_CreateObject();
     cJSON *topbar = cJSON_CreateObject();
+    cJSON *appearance = cJSON_CreateObject();
     if (root == NULL || wifi == NULL || ha == NULL || time_cfg == NULL || ui == NULL || xiaozhi == NULL ||
         sd == NULL || network == NULL || camera == NULL || camera_image == NULL || system == NULL || audio == NULL ||
-        topbar == NULL) {
+        topbar == NULL || appearance == NULL) {
         cJSON_Delete(root);
         cJSON_Delete(wifi);
         cJSON_Delete(ha);
@@ -271,6 +272,10 @@ static esp_err_t write_public_settings_file(const runtime_settings_t *settings)
     cJSON_AddBoolToObject(topbar, "show_brightness", settings->topbar_show_brightness);
     cJSON_AddItemToObject(root, "topbar", topbar);
 
+    cJSON_AddStringToObject(appearance, "page_wallpaper", settings->page_wallpaper);
+    cJSON_AddNumberToObject(appearance, "tile_transparency", settings->tile_transparency);
+    cJSON_AddItemToObject(root, "appearance", appearance);
+
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (payload == NULL) {
@@ -329,6 +334,12 @@ static esp_err_t parse_settings_json(
     cJSON *system = cJSON_GetObjectItemCaseSensitive(root, "system");
     cJSON *audio = cJSON_GetObjectItemCaseSensitive(root, "audio");
     cJSON *topbar = cJSON_GetObjectItemCaseSensitive(root, "topbar");
+    cJSON *appearance = cJSON_GetObjectItemCaseSensitive(root, "appearance");
+
+    if (cJSON_IsObject(appearance)) {
+        json_copy_string(appearance, "page_wallpaper", out->page_wallpaper, sizeof(out->page_wallpaper));
+        json_copy_int(appearance, "tile_transparency", &out->tile_transparency, 0, 100);
+    }
 
     if (cJSON_IsObject(wifi)) {
         json_copy_string(wifi, "ssid", out->wifi_ssid, sizeof(out->wifi_ssid));
@@ -764,6 +775,9 @@ void runtime_settings_set_defaults(runtime_settings_t *out)
     out->daily_restart_hour = -1;
     out->touch_test = false;
     out->audio_volume = 80;
+
+    out->page_wallpaper[0] = '\0';
+    out->tile_transparency = 0;
 
     out->topbar_show_clock = true;
     out->topbar_show_room_name = false;

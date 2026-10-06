@@ -1008,6 +1008,7 @@ esp_err_t w_sensor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui_
 
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, def->title[0] ? def->title : def->id);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(title, lv_color_hex(APP_UI_COLOR_TEXT_SOFT), LV_PART_MAIN);
 
     sensor_tile_ctx_t *ctx = ui_calloc_prefer_psram(1, sizeof(sensor_tile_ctx_t));
@@ -1048,6 +1049,8 @@ esp_err_t w_sensor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui_
 
         if (ctx->rows[i].is_bar) {
             ctx->rows[i].bar = lv_bar_create(card);
+            lv_obj_clear_flag(ctx->rows[i].bar, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(ctx->rows[i].bar, LV_OBJ_FLAG_SCROLLABLE);
             lv_bar_set_range(ctx->rows[i].bar, 0, 100);
             lv_bar_set_value(ctx->rows[i].bar, 0, LV_ANIM_OFF);
             lv_obj_set_style_bg_color(ctx->rows[i].bar, lv_color_hex(APP_UI_COLOR_CARD_BORDER), LV_PART_MAIN);

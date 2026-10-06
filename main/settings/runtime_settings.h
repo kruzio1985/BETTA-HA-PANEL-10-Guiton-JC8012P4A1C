@@ -98,6 +98,10 @@ typedef struct {
     char topbar_room_name[APP_TOP_BAR_ROOM_NAME_MAX_LEN];
     bool topbar_show_status;
     bool topbar_show_brightness;
+
+    /* Appearance: page wallpaper + tile transparency. */
+    char page_wallpaper[APP_MAX_IMAGE_PATH_LEN]; /* "" = no wallpaper; else /sdcard/bg/... image shown behind tiles */
+    int tile_transparency;                       /* 0..100; 0 = opaque tiles, higher = more transparent */
 } runtime_settings_t;
 
 void runtime_settings_set_defaults(runtime_settings_t *out);

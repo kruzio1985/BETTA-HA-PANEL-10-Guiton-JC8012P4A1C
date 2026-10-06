@@ -265,9 +265,10 @@ esp_err_t api_settings_get_handler(httpd_req_t *req)
     cJSON *audio = cJSON_CreateObject();
     cJSON *display = cJSON_CreateObject();
     cJSON *topbar = cJSON_CreateObject();
+    cJSON *appearance = cJSON_CreateObject();
     if (root == NULL || wifi == NULL || ha == NULL || time_cfg == NULL || ui == NULL || xiaozhi == NULL ||
         sd == NULL || network == NULL || camera == NULL || camera_image == NULL || system == NULL ||
-        audio == NULL || display == NULL || topbar == NULL) {
+        audio == NULL || display == NULL || topbar == NULL || appearance == NULL) {
         cJSON_Delete(root);
         cJSON_Delete(wifi);
         cJSON_Delete(ha);
@@ -435,6 +436,10 @@ esp_err_t api_settings_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(topbar, "show_status", settings->topbar_show_status);
     cJSON_AddBoolToObject(topbar, "show_brightness", settings->topbar_show_brightness);
     cJSON_AddItemToObject(root, "topbar", topbar);
+
+    cJSON_AddStringToObject(appearance, "page_wallpaper", settings->page_wallpaper);
+    cJSON_AddNumberToObject(appearance, "tile_transparency", settings->tile_transparency);
+    cJSON_AddItemToObject(root, "appearance", appearance);
 
     cJSON_AddBoolToObject(root, "ok", true);
 
@@ -605,6 +610,7 @@ esp_err_t api_settings_put_handler(httpd_req_t *req)
     cJSON *audio = cJSON_GetObjectItemCaseSensitive(root, "audio");
     cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
     cJSON *topbar = cJSON_GetObjectItemCaseSensitive(root, "topbar");
+    cJSON *appearance = cJSON_GetObjectItemCaseSensitive(root, "appearance");
     if (wifi != NULL && !cJSON_IsObject(wifi)) {
         cJSON_Delete(root);
         free(settings);
@@ -797,6 +803,11 @@ esp_err_t api_settings_put_handler(httpd_req_t *req)
             topbar, "room_name", settings->topbar_room_name, sizeof(settings->topbar_room_name), &invalid_type, &too_long);
         (void)update_bool_setting(topbar, "show_status", &settings->topbar_show_status, &invalid_type);
         (void)update_bool_setting(topbar, "show_brightness", &settings->topbar_show_brightness, &invalid_type);
+    }
+    if (cJSON_IsObject(appearance)) {
+        (void)update_string_setting(
+            appearance, "page_wallpaper", settings->page_wallpaper, sizeof(settings->page_wallpaper), &invalid_type, &too_long);
+        (void)update_int_setting(appearance, "tile_transparency", &settings->tile_transparency, 0, 100, &invalid_type);
     }
     if (cJSON_IsObject(display)) {
         /* The display power policy lives in its own NVS (display driver), so it

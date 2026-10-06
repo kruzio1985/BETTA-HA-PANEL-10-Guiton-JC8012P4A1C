@@ -26,6 +26,7 @@
 #include "freertos/task.h"
 
 #include "app_config.h"
+#include "diag/storage_guard.h"
 #include "ui/ui_ota_progress.h"
 #include "util/log_tags.h"
 
@@ -371,6 +372,26 @@ static void ota_stream_set_error(api_ota_stream_t *stream, const char *message)
     strlcpy(stream->error, message != NULL ? message : "OTA stream failed", sizeof(stream->error));
 }
 
+/* Only an OTA-slot partition can receive a new image (the bootloader refuses to
+ * stage into `factory`), and the running partition can never be the target.
+ * With the single-OTA-slot layout (factory + ota_0) an update is therefore only
+ * possible while the panel runs from `factory`; api_ota_switch_slot_post_handler
+ * provides the escape hatch when it currently runs from ota_0. */
+static const esp_partition_t *ota_select_target_partition(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (next != NULL && running != NULL && next == running) {
+        return NULL;
+    }
+    return next;
+}
+
+static const esp_partition_t *ota_factory_partition(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+}
+
 static esp_err_t ota_stream_init(api_ota_stream_t *stream, size_t total)
 {
     if (stream == NULL) {
@@ -379,7 +400,7 @@ static esp_err_t ota_stream_init(api_ota_stream_t *stream, size_t total)
     memset(stream, 0, sizeof(*stream));
     stream->total = total;
 
-    stream->partition = esp_ota_get_next_update_partition(NULL);
+    stream->partition = ota_select_target_partition();
     if (stream->partition == NULL) {
         ota_stream_set_error(stream, "No OTA partition found. Flash the new OTA-capable factory image first.");
         return ESP_ERR_NOT_FOUND;
@@ -505,16 +526,28 @@ static esp_err_t ota_stream_finish(api_ota_stream_t *stream)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    /* esp_ota_end() + esp_ota_set_boot_partition() both map and unmap every
+     * image segment (esp_image_verify), i.e. they reprogram MMU pages — and
+     * this build runs .text/.rodata from PSRAM through that same MMU
+     * (CONFIG_SPIRAM_XIP_FROM_PSRAM=y).  A LittleFS append landing in one of
+     * those windows resets the chip ~2 s later with rst:0x7 (HP_SYS_HP_WDT)
+     * and no panic.  Hold the background flash writers off until the boot slot
+     * is committed; they keep their bytes in RAM and flush right after. */
+    storage_guard_flash_writers_pause();
+
+    bool boot_slot_failed = false;
     esp_err_t err = esp_ota_end(stream->handle);
     stream->begun = false;
-    if (err != ESP_OK) {
-        ota_stream_set_error(stream, "OTA image validation failed");
-        return err;
+    if (err == ESP_OK) {
+        err = esp_ota_set_boot_partition(stream->partition);
+        boot_slot_failed = (err != ESP_OK);
     }
 
-    err = esp_ota_set_boot_partition(stream->partition);
+    storage_guard_flash_writers_resume();
+
     if (err != ESP_OK) {
-        ota_stream_set_error(stream, "Failed to select OTA boot partition");
+        ota_stream_set_error(stream, boot_slot_failed ? "Failed to select OTA boot partition"
+                                                      : "OTA image validation failed");
         return err;
     }
     return ESP_OK;
@@ -565,7 +598,7 @@ static esp_err_t ota_send_status_json(httpd_req_t *req)
     status = s_ota_status;
     xSemaphoreGive(s_ota_mutex);
 
-    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    const esp_partition_t *next = ota_select_target_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
 
     cJSON *root = cJSON_CreateObject();
@@ -675,6 +708,7 @@ static void ota_url_task(void *arg)
     esp_http_client_handle_t client = NULL;
     char *chunk = NULL;
     esp_err_t err = ESP_OK;
+    bool guard_open = false;
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -731,6 +765,10 @@ static void ota_url_task(void *arg)
         goto done;
     }
 
+    /* Same watchdog hold-off as the upload path (see api_ota_upload_post_handler). */
+    storage_guard_begin("ota-download");
+    guard_open = true;
+
     bool read_failed = false;
     while (true) {
         int read = esp_http_client_read(client, chunk, APP_OTA_CHUNK_SIZE);
@@ -768,6 +806,9 @@ static void ota_url_task(void *arg)
     ota_schedule_restart();
 
 done:
+    if (guard_open) {
+        storage_guard_end();
+    }
     if (chunk != NULL) {
         heap_caps_free(chunk);
     }
@@ -805,7 +846,7 @@ esp_err_t api_ota_url_post_handler(httpd_req_t *req)
         return send_json_error(req, "400 Bad Request", "OTA URL must be an https:// URL or a supported GitHub blob/raw URL");
     }
 
-    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    const esp_partition_t *partition = ota_select_target_partition();
     if (partition == NULL) {
         return send_json_error(req, "409 Conflict", "No OTA partition found. Flash the OTA-capable factory image first.");
     }
@@ -836,7 +877,7 @@ esp_err_t api_ota_upload_post_handler(httpd_req_t *req)
         return send_json_error(req, "400 Bad Request", "Missing OTA binary body");
     }
 
-    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    const esp_partition_t *partition = ota_select_target_partition();
     if (partition == NULL) {
         return send_json_error(req, "409 Conflict", "No OTA partition found. Flash the OTA-capable factory image first.");
     }
@@ -860,8 +901,14 @@ esp_err_t api_ota_upload_post_handler(httpd_req_t *req)
         return httpd_resp_send_500(req);
     }
 
+    /* Writing a whole image parks the idle tasks far longer than the task
+     * watchdog allows and silences the UI heartbeat, so hold both watchdogs off
+     * (and keep background exporters out of the way) for the transfer. */
+    storage_guard_begin("ota-upload");
+
+    err = ESP_OK;
     int received = 0;
-    while (received < req->content_len) {
+    while (err == ESP_OK && received < req->content_len) {
         int remaining = req->content_len - received;
         int to_read = remaining > APP_OTA_CHUNK_SIZE ? APP_OTA_CHUNK_SIZE : remaining;
         int r = httpd_req_recv(req, (char *)buf, to_read);
@@ -869,32 +916,72 @@ esp_err_t api_ota_upload_post_handler(httpd_req_t *req)
             continue;
         }
         if (r <= 0) {
-            ota_stream_abort(&stream);
-            heap_caps_free(buf);
-            ota_finish_status_error("OTA upload aborted");
-            return send_json_error(req, "400 Bad Request", "OTA upload aborted");
+            err = ESP_FAIL;
+            break;
         }
 
         err = ota_stream_write_checked(&stream, buf, (size_t)r);
-        if (err != ESP_OK) {
-            ota_stream_abort(&stream);
-            heap_caps_free(buf);
-            ota_finish_status_error(stream.error);
-            return send_json_error(req, "400 Bad Request", stream.error);
-        }
         received += r;
+    }
+
+    if (err == ESP_OK) {
+        err = ota_stream_finish(&stream);
+    }
+
+    if (err != ESP_OK) {
+        ota_stream_abort(&stream);
     }
     heap_caps_free(buf);
 
-    err = ota_stream_finish(&stream);
+    storage_guard_end();
+
+    if (err == ESP_FAIL) {
+        ota_finish_status_error("OTA upload aborted");
+        return send_json_error(req, "400 Bad Request", "OTA upload aborted");
+    }
     if (err != ESP_OK) {
-        ota_stream_abort(&stream);
         ota_finish_status_error(stream.error);
         return send_json_error(req, "400 Bad Request", stream.error);
     }
 
     ota_finish_status_success();
     esp_err_t send_err = ota_send_status_json(req);
+    ota_schedule_restart();
+    return send_err;
+}
+
+/* POST /api/ota/switch-slot
+ * With the factory + ota_0 layout the panel can only install an update while it
+ * boots from `factory` (the bootloader refuses to stage into the running slot).
+ * This clears the OTA selection so the next boot lands on `factory`, which makes
+ * the following OTA upload writable again. */
+esp_err_t api_ota_switch_slot_post_handler(httpd_req_t *req)
+{
+    const esp_partition_t *factory = ota_factory_partition();
+    if (factory == NULL) {
+        return send_json_error(req, "409 Conflict", "No factory partition on this layout");
+    }
+
+    esp_err_t err = esp_ota_set_boot_partition(factory);
+    if (err != ESP_OK) {
+        return send_json_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        return httpd_resp_send_500(req);
+    }
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "rebooting", true);
+    cJSON_AddStringToObject(root, "next_boot", factory->label);
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return httpd_resp_send_500(req);
+    }
+    set_json_headers(req);
+    esp_err_t send_err = httpd_resp_sendstr(req, payload);
+    cJSON_free(payload);
     ota_schedule_restart();
     return send_err;
 }

@@ -31,6 +31,20 @@ int system_log_read_tail(char *buf, size_t buf_len);
  * heartbeat line so the log viewer is not left empty. */
 esp_err_t system_log_clear(void);
 
+/* Suspend/resume the UI heartbeat watchdog around a deliberately long storage
+ * operation (microSD format, firmware upload).  The suspension is counted
+ * (nested operations are safe) and expires on its own after
+ * APP_LOG_WATCHDOG_PAUSE_MAX_MS so a genuinely hung operation cannot disable
+ * the watchdog forever. */
+void system_log_watchdog_suspend(void);
+void system_log_watchdog_resume(void);
+
+/* Log-file appends held back in RAM while the storage guard paused the flash
+ * writers (see diag/storage_guard.h).  The counter proves the pause window
+ * actually covered the MMU reprogramming inside esp_ota_end(). */
+uint32_t system_log_gated_writes(void);
+void system_log_gated_writes_reset(void);
+
 /* Explicitly record a diagnostic error line. Use from error paths that would
  * otherwise fail silently. */
 void system_log_write(const char *tag, const char *fmt, ...);
