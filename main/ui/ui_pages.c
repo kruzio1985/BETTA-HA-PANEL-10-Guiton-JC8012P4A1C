@@ -59,6 +59,7 @@ static lv_obj_t *s_room_name_label = NULL;
 static lv_obj_t *s_brightness_icon = NULL;
 /* Cached page wallpaper image (decoded at content-box size). */
 static lv_image_dsc_t s_wallpaper_dsc = {0};
+static char s_wallpaper_path[APP_MAX_IMAGE_PATH_LEN] = "";
 static bool s_wallpaper_loaded = false;
 static ui_topbar_config_t s_topbar_cfg = {
     .show_clock = true,
@@ -902,6 +903,21 @@ void ui_pages_set_topbar_datetime(const struct tm *timeinfo)
 
 void ui_pages_set_wallpaper(const char *path)
 {
+    const char *target = (path != NULL) ? path : "";
+
+    /* The PNG decode is expensive and needs a large contiguous PSRAM block.
+     * If the same wallpaper is already decoded, just re-attach the cached
+     * image (e.g. after ui_pages_reset() rebuilt the content box) instead of
+     * re-decoding - later decodes can fail once the dashboard has consumed
+     * most PSRAM (lodepng error 83). */
+    if (s_wallpaper_loaded && s_content_box != NULL &&
+        strcmp(s_wallpaper_path, target) == 0) {
+        lv_obj_set_style_bg_image_src(s_content_box, &s_wallpaper_dsc, LV_PART_MAIN);
+        lv_obj_set_style_bg_image_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_image_tiled(s_content_box, false, LV_PART_MAIN);
+        return;
+    }
+
     /* Free any previously cached image. */
     if (s_wallpaper_dsc.data != NULL) {
         heap_caps_free((void *)s_wallpaper_dsc.data);
@@ -911,6 +927,7 @@ void ui_pages_set_wallpaper(const char *path)
     s_wallpaper_dsc.header.w = 0;
     s_wallpaper_dsc.header.h = 0;
     s_wallpaper_loaded = false;
+    s_wallpaper_path[0] = '\0';
 
     if (s_content_box == NULL) {
         return;
@@ -918,17 +935,18 @@ void ui_pages_set_wallpaper(const char *path)
 
     lv_obj_set_style_bg_image_src(s_content_box, NULL, LV_PART_MAIN);
 
-    if (path == NULL || path[0] == '\0') {
+    if (target[0] == '\0') {
         lv_obj_set_style_bg_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
         return;
     }
 
-    if (!ui_image_load_file(path, APP_CONTENT_BOX_WIDTH, APP_CONTENT_BOX_HEIGHT, &s_wallpaper_dsc)) {
+    if (!ui_image_load_file(target, APP_CONTENT_BOX_WIDTH, APP_CONTENT_BOX_HEIGHT, &s_wallpaper_dsc)) {
         /* Fall back to the solid content background. */
         lv_obj_set_style_bg_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);
         return;
     }
 
+    strlcpy(s_wallpaper_path, target, sizeof(s_wallpaper_path));
     s_wallpaper_loaded = true;
     lv_obj_set_style_bg_image_src(s_content_box, &s_wallpaper_dsc, LV_PART_MAIN);
     lv_obj_set_style_bg_image_opa(s_content_box, LV_OPA_COVER, LV_PART_MAIN);

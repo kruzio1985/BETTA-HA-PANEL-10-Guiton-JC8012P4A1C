@@ -1207,6 +1207,10 @@ esp_err_t ui_runtime_init(void)
     theme_default_set_tile_transparency(runtime_settings.tile_transparency);
     theme_default_rebuild_styles();
     ui_pages_init();
+    /* Decode + cache the wallpaper now, while PSRAM is still mostly free.
+     * ui_runtime_load_layout() later re-attaches the cached image after the
+     * screen rebuild without re-decoding. */
+    ui_pages_set_wallpaper(runtime_settings.page_wallpaper);
     ui_pages_set_show_callback(ui_runtime_on_page_shown);
     ui_settings_init();
     ui_runtime_show_weather_icon_overlay();

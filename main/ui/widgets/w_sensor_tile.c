@@ -163,7 +163,22 @@ static void sensor_tile_format_state(const ha_state_t *state, char *buf, size_t 
     }
 
     float value = 0.0f;
-    if (sensor_tile_parse_float(state->state, &value) && unit != NULL && unit[0] != '\0') {
+    if (sensor_tile_parse_float(state->state, &value)) {
+        /* Round to one decimal and drop a trailing ".0" so long decimals
+         * (e.g. router speed "52.8760440150454") don't overflow the value
+         * column, while "64" stays "64" and "70.25" becomes "70.3". */
+        char num[32] = {0};
+        snprintf(num, sizeof(num), "%.1f", value);
+        size_t n = strlen(num);
+        if (n >= 2 && num[n - 2] == '.' && num[n - 1] == '0') {
+            num[n - 2] = '\0';
+        }
+        if (unit != NULL && unit[0] != '\0') {
+            snprintf(buf, len, "%s %s", num, unit);
+        } else {
+            snprintf(buf, len, "%s", num);
+        }
+    } else if (unit != NULL && unit[0] != '\0') {
         snprintf(buf, len, "%s %s", state->state, unit);
     } else {
         snprintf(buf, len, "%s", state->state);
@@ -507,16 +522,11 @@ static const lv_font_t *sensor_tile_pick_font(lv_coord_t budget_px, lv_coord_t *
     return best;
 }
 
-/* Web-editor font overrides (sensor_tile_*_font_px) are expressed as a point
- * size, but sensor_tile_pick_font() works on a line-height budget. Poppins line
- * height is ~1.4x the point size, so scale the request before delegating. */
+/* Web-editor font overrides (sensor_tile_*_font_px) are a line-height budget:
+ * the picker below selects the largest available font whose line height fits. */
 static const lv_font_t *sensor_tile_pick_font_by_px(int px, lv_coord_t *out_line_h)
 {
-    int budget = (px * 14) / 10;
-    if (budget < 10) {
-        budget = 10;
-    }
-    return sensor_tile_pick_font(budget, out_line_h);
+    return sensor_tile_pick_font(px, out_line_h);
 }
 
 /* Measure (and prepare) a ":ports" row: the value label wraps its full port
