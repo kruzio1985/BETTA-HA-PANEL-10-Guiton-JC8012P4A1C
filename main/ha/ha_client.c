@@ -3943,6 +3943,27 @@ static bool ha_client_token_entity(const char *start, const char *end, char *out
         }
     }
 
+    /* Strip auxiliary ":color=X" (may appear before the main suffix) and
+     * ":ping" (panel-side ping row whose token is an IP, not an HA entity). */
+    {
+        const char *p = start;
+        while (p + 7 <= end) {
+            if (strncmp(p, ":color=", 7) == 0) {
+                end = p;
+                break;
+            }
+            p++;
+        }
+    }
+    bool is_ping = false;
+    {
+        size_t alen = (size_t)(end - start);
+        if (alen >= 5 && strncmp(end - 5, ":ping", 5) == 0) {
+            end -= 5;
+            is_ping = true;
+        }
+    }
+
     /* Strip an optional per-row style suffix. Keep this in sync with the
      * sensor_tile widget and layout_validate: ":bar", ":dot", ":status",
      * ":chart", ":ports", ":ip" and ":power" with an optional colour
@@ -3976,6 +3997,10 @@ static bool ha_client_token_entity(const char *start, const char *end, char *out
 
     size_t len = (size_t)(end - start);
     if (len == 0 || len >= out_len) {
+        return false;
+    }
+    if (is_ping) {
+        /* Panel-side ping rows use an IPv4 address, not an HA entity id. */
         return false;
     }
     memcpy(out, start, len);

@@ -82,6 +82,36 @@ static bool entity_in_domain(const char *entity_id, const char *domain)
     return strncmp(entity_id, domain, domain_len) == 0 && entity_id[domain_len] == '.';
 }
 
+/* Simple dotted-quad IPv4 check (used for panel-side ":ping" rows). */
+static bool is_valid_ipv4(const char *ip)
+{
+    if (ip == NULL || ip[0] == '\0') {
+        return false;
+    }
+    int octets = 0;
+    int digits = 0;
+    int value = 0;
+    for (const char *p = ip; *p != '\0'; p++) {
+        if (*p == '.') {
+            if (digits == 0 || value > 255) {
+                return false;
+            }
+            octets++;
+            digits = 0;
+            value = 0;
+        } else if (isdigit((unsigned char)*p)) {
+            digits++;
+            value = value * 10 + (*p - '0');
+            if (digits > 3 || value > 255) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return octets == 3 && digits > 0 && value <= 255;
+}
+
 static bool is_valid_entity_id_list(const char *list, size_t max_count, size_t *out_count)
 {
     if (out_count != NULL) {
@@ -221,6 +251,28 @@ static bool is_valid_labeled_entity_list(const char *list, size_t max_rows, cons
             }
             memcpy(entity, entity_start, entity_len);
             entity[entity_len] = '\0';
+            /* Strip auxiliary suffixes (":ping" and ":color=X"), mirroring
+             * sensor_tile_strip_aux_style(). A ":ping" row uses a dotted-quad
+             * IPv4 address as its token instead of an HA entity id. */
+            bool is_ping = false;
+            for (;;) {
+                size_t alen = strlen(entity);
+                if (alen >= 5 && strcmp(entity + alen - 5, ":ping") == 0) {
+                    entity[alen - 5] = '\0';
+                    is_ping = true;
+                    continue;
+                }
+                char *color = strstr(entity, ":color=");
+                if (color != NULL) {
+                    char *tok = color + 7;
+                    while (*tok != '\0' && *tok != ':') {
+                        tok++;
+                    }
+                    memmove(color, tok, strlen(tok) + 1);
+                    continue;
+                }
+                break;
+            }
             /* Strip an optional per-row style suffix. Keep this in sync with
              * the sensor_tile widget: ":bar", ":dot", ":status", ":chart",
              * ":ports", ":ip" and ":power" with an optional colour
@@ -247,13 +299,19 @@ static bool is_valid_labeled_entity_list(const char *list, size_t max_rows, cons
                     *p = '\0';
                 }
             }
-            if (entity[0] != '\0' && !is_valid_entity_id(entity)) {
-                if (reason != NULL) {
-                    snprintf(s_labeled_list_reason, sizeof(s_labeled_list_reason),
-                        "invalid entity id in row %d", (int)count + 1);
-                    *reason = s_labeled_list_reason;
+            if (entity[0] != '\0') {
+                bool valid = is_valid_entity_id(entity);
+                if (!valid && is_ping && is_valid_ipv4(entity)) {
+                    valid = true;
                 }
-                return false;
+                if (!valid) {
+                    if (reason != NULL) {
+                        snprintf(s_labeled_list_reason, sizeof(s_labeled_list_reason),
+                            "invalid entity id in row %d", (int)count + 1);
+                        *reason = s_labeled_list_reason;
+                    }
+                    return false;
+                }
             }
         }
 

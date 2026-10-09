@@ -18,12 +18,24 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_err.h"
+#include "esp_log.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
+#include <errno.h>
+#include <fcntl.h>
 
 #include "ui/fonts/app_text_fonts.h"
 #include "ui/ui_memory.h"
 #include "ui/theme/theme_default.h"
 
 #define SENSOR_TILE_DOT_SIZE 10
+#define SENSOR_TILE_TCP_PORT 80
+#define SENSOR_TILE_TCP_CONNECT_TIMEOUT_MS 800
+#define SENSOR_TILE_TCP_ROUND_DELAY_MS 3000
 #define SENSOR_TILE_CHART_POINTS 32
 #define SENSOR_TILE_CHART_SCALE 100
 #define SENSOR_TILE_IP_ROW_H 34
@@ -33,6 +45,8 @@
 typedef struct {
     lv_obj_t *card;
     lv_obj_t *title_label;
+    lv_timer_t *ping_timer;
+    TaskHandle_t tcp_task;
     uint8_t row_count;
     int title_font_px;
     int row_font_px;
@@ -50,6 +64,10 @@ typedef struct {
         bool is_power;
         bool has_power_color;
         lv_color_t power_color;
+        bool is_ping;
+        bool has_label_color;
+        lv_color_t label_color;
+        volatile bool ping_alive;
         lv_obj_t *dot;
         lv_obj_t *bar;
         lv_obj_t *chart;
@@ -130,6 +148,15 @@ static lv_color_t sensor_tile_status_color(const char *state_text)
         return lv_color_hex(APP_UI_COLOR_ERROR);
     }
     return lv_color_hex(APP_UI_COLOR_OK);
+}
+
+/* Boolean mirror of sensor_tile_status_color(): anything not explicitly
+ * off/missing is treated as "on" (so an unavailable device reads "off"). */
+static bool sensor_tile_status_is_on(const char *state_text)
+{
+    return !sensor_tile_state_is_missing(state_text) &&
+           !sensor_tile_state_is_offline(state_text) &&
+           !sensor_tile_state_is_error(state_text);
 }
 
 static bool sensor_tile_parse_float(const char *text, float *out)
@@ -285,6 +312,178 @@ static bool sensor_tile_power_color_parse(const char *text, lv_color_t *out)
     return true;
 }
 
+/* Strip auxiliary row suffixes that can be combined with the main style:
+ *   ":ping"   -> the token is an IPv4 address to ping from the panel itself
+ *   ":color=X" -> X is a named colour or "#RRGGBB" for the row's label text
+ * Both may appear in any order (e.g. "192.168.1.130:ping:color=cyan"). */
+static void sensor_tile_strip_aux_style(char *entity, bool *is_ping,
+                                        bool *has_label_color, lv_color_t *label_color)
+{
+    if (entity == NULL) {
+        return;
+    }
+    if (is_ping != NULL) {
+        *is_ping = false;
+    }
+    if (has_label_color != NULL) {
+        *has_label_color = false;
+    }
+
+    for (;;) {
+        size_t len = strlen(entity);
+        if (len >= 5 && strcmp(entity + len - 5, ":ping") == 0) {
+            entity[len - 5] = '\0';
+            if (is_ping != NULL) {
+                *is_ping = true;
+            }
+            continue;
+        }
+        /* ":color=" followed by a token up to the next ':' (or end). */
+        char *c = strstr(entity, ":color=");
+        if (c != NULL && (c == entity || c[-1] != '.')) {
+            char color_token[16] = {0};
+            char *tok = c + 7;
+            size_t i = 0;
+            while (tok[i] != '\0' && tok[i] != ':' && i + 1 < sizeof(color_token)) {
+                color_token[i] = tok[i];
+                i++;
+            }
+            color_token[i] = '\0';
+            if (label_color != NULL && sensor_tile_power_color_parse(color_token, label_color)) {
+                if (has_label_color != NULL) {
+                    *has_label_color = true;
+                }
+            }
+            memmove(c, tok + i, strlen(tok + i) + 1);
+            continue;
+        }
+        break;
+    }
+}
+
+/* TCP "ping": open a non-blocking connection to the device's well-known port
+ * (80). A completed connect or an immediate ECONNREFUSED both prove the host
+ * is up; only a timeout / unreachable means the host is offline. This uses the
+ * standard socket API, which works reliably over the ESP-Hosted WiFi link
+ * (unlike raw ICMP sockets). */
+static bool sensor_tile_tcp_probe(const char *ip, uint16_t port, int timeout_ms)
+{
+    if (ip == NULL || ip[0] == '\0') {
+        return false;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        return false;
+    }
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(ip);
+
+    bool online = false;
+    int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret == 0) {
+        online = true;
+    } else if (errno == ECONNREFUSED) {
+        /* Host answered with RST: it is up, just the port is closed. */
+        online = true;
+    } else if (errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        ret = select(sock + 1, NULL, &wfds, NULL, &tv);
+        if (ret > 0) {
+            int so_err = 0;
+            socklen_t so_len = sizeof(so_err);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
+            online = (so_err == 0) || (so_err == ECONNREFUSED);
+        }
+    }
+    close(sock);
+    return online;
+}
+
+/* Background task: re-probe every ":ping" row each round. Only this task
+ * writes ping_alive; the LVGL timer below marshals it onto the dots. */
+static void sensor_tile_tcp_check_task(void *arg)
+{
+    sensor_tile_ctx_t *ctx = (sensor_tile_ctx_t *)arg;
+    if (ctx == NULL) {
+        vTaskDelete(NULL);
+        return;
+    }
+    for (;;) {
+        for (uint8_t i = 0; i < ctx->row_count; i++) {
+            if (!ctx->rows[i].is_ping) {
+                continue;
+            }
+            bool alive = sensor_tile_tcp_probe(
+                ctx->rows[i].entity_id, SENSOR_TILE_TCP_PORT,
+                SENSOR_TILE_TCP_CONNECT_TIMEOUT_MS);
+            if (alive != ctx->rows[i].ping_alive) {
+                ESP_LOGI("sensor_tile", "tcp %s: %s",
+                         alive ? "up" : "down", ctx->rows[i].entity_id);
+            }
+            ctx->rows[i].ping_alive = alive;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_TILE_TCP_ROUND_DELAY_MS));
+    }
+}
+
+/* Periodic (1 s) refresh: apply the latest probe results to the status dots.
+ * The probe task only flips a volatile flag; this timer marshals the result
+ * onto the LVGL task. */
+static void sensor_tile_ping_timer_cb(lv_timer_t *timer)
+{
+    sensor_tile_ctx_t *ctx = (sensor_tile_ctx_t *)lv_timer_get_user_data(timer);
+    if (ctx == NULL) {
+        return;
+    }
+    for (uint8_t i = 0; i < ctx->row_count; i++) {
+        if (!ctx->rows[i].is_ping || ctx->rows[i].dot == NULL) {
+            continue;
+        }
+        lv_color_t c = ctx->rows[i].ping_alive
+            ? lv_color_hex(APP_UI_COLOR_OK)
+            : lv_color_hex(APP_UI_COLOR_ERROR);
+        lv_obj_set_style_bg_color(ctx->rows[i].dot, c, LV_PART_MAIN);
+        if (ctx->rows[i].value_label != NULL) {
+            lv_label_set_text(ctx->rows[i].value_label, ctx->rows[i].ping_alive ? "on" : "off");
+        }
+    }
+}
+
+static void sensor_tile_ping_start(sensor_tile_ctx_t *ctx)
+{
+    if (ctx == NULL || ctx->tcp_task != NULL) {
+        return;
+    }
+    bool any = false;
+    for (uint8_t i = 0; i < ctx->row_count; i++) {
+        if (ctx->rows[i].is_ping) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return;
+    }
+    BaseType_t ok = xTaskCreate(sensor_tile_tcp_check_task, "sensor_tile_tcp",
+                                3072, ctx, 4, &ctx->tcp_task);
+    if (ok != pdPASS) {
+        ESP_LOGW("sensor_tile", "failed to start TCP check task");
+        ctx->tcp_task = NULL;
+    }
+}
+
 /* Strip an optional per-row style suffix (":bar" / ":dot" / ":status" /
  * ":chart" / ":ports" / ":ip" / ":power[:color]") from an entity token.
  * Returns true when a recognized suffix was stripped and sets *is_bar /
@@ -422,6 +621,9 @@ static int sensor_tile_parse_rows(sensor_tile_ctx_t *ctx, const char *list)
         bool is_power = false;
         bool has_power_color = false;
         lv_color_t power_color = lv_color_hex(0xFFFFFF);
+        bool is_ping = false;
+        bool has_label_color = false;
+        lv_color_t label_color = lv_color_hex(0xFFFFFF);
         if (eq < end) {
             if (!sensor_tile_trim_copy(start, eq, label, sizeof(label))) {
                 continue;
@@ -437,15 +639,21 @@ static int sensor_tile_parse_rows(sensor_tile_ctx_t *ctx, const char *list)
             label[0] = '\0';
         }
 
+        sensor_tile_strip_aux_style(entity, &is_ping, &has_label_color, &label_color);
         bool explicit_style = sensor_tile_strip_row_style(entity, &is_bar, &is_status, &is_chart, &is_ports, &is_ip,
                                                            &is_power, &has_power_color, &power_color);
         if (entity[0] == '\0') {
             continue; /* entity consisted only of a style -> hidden row */
         }
+        /* A ":ping" row is a panel-side status row: the token is an IPv4
+         * address, not an HA entity. */
+        if (is_ping) {
+            is_status = true;
+        }
         /* Binary sensors are inherently on/off: render them as a coloured
          * status circle (green = on, red = off) unless the user picked an
          * explicit style (":bar", ":chart", ":dot" or ":status"). */
-        if (!explicit_style && strncmp(entity, "binary_sensor.", 14) == 0) {
+        if (!explicit_style && !is_ping && strncmp(entity, "binary_sensor.", 14) == 0) {
             is_status = true;
         }
         if (label[0] == '\0') {
@@ -462,6 +670,10 @@ static int sensor_tile_parse_rows(sensor_tile_ctx_t *ctx, const char *list)
         ctx->rows[count].is_power = is_power;
         ctx->rows[count].has_power_color = has_power_color;
         ctx->rows[count].power_color = power_color;
+        ctx->rows[count].is_ping = is_ping;
+        ctx->rows[count].has_label_color = has_label_color;
+        ctx->rows[count].label_color = label_color;
+        ctx->rows[count].ping_alive = false;
         count++;
     }
     return (int)count;
@@ -904,6 +1116,50 @@ static void sensor_tile_apply_layout(sensor_tile_ctx_t *ctx)
          * amount to optically align it with the dot / bar / value. */
         lv_coord_t text_y = y + (row_h - line_h) / 2 + row_font->base_line / 2;
 
+        /* Group-coloured rows (device status list) render uniformly:
+         * [label coloured by group] ........ [value for sensors][status dot].
+         * The dot on the right carries online/offline (green/red). */
+        if (ctx->rows[i].has_label_color) {
+            lv_coord_t dot_s = status_dot_size;
+            if (dot_s > row_h - 2) {
+                dot_s = (row_h - 2 > 4) ? row_h - 2 : 4;
+            }
+            if (ctx->rows[i].bar != NULL) {
+                lv_obj_add_flag(ctx->rows[i].bar, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (ctx->rows[i].chart != NULL) {
+                lv_obj_add_flag(ctx->rows[i].chart, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (ctx->rows[i].dot != NULL) {
+                lv_obj_clear_flag(ctx->rows[i].dot, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_size(ctx->rows[i].dot, dot_s, dot_s);
+                lv_obj_set_pos(ctx->rows[i].dot, cw - dot_s, y + (row_h - dot_s) / 2);
+            }
+            lv_coord_t label_x = 2;
+            lv_coord_t v_w = ctx->rows[i].is_status ? 96 : 40;
+            if (ctx->rows[i].name_label != NULL) {
+                lv_label_set_long_mode(ctx->rows[i].name_label, LV_LABEL_LONG_CLIP);
+                lv_obj_set_style_text_font(ctx->rows[i].name_label, row_font, LV_PART_MAIN);
+                lv_obj_set_style_text_align(ctx->rows[i].name_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+                lv_coord_t name_w2 = cw - label_x - dot_s - 10 - v_w - 4;
+                if (name_w2 < 40) {
+                    name_w2 = 40;
+                }
+                lv_obj_set_size(ctx->rows[i].name_label, name_w2, line_h);
+                lv_obj_set_pos(ctx->rows[i].name_label, label_x, text_y);
+            }
+            if (ctx->rows[i].value_label != NULL) {
+                lv_obj_clear_flag(ctx->rows[i].value_label, LV_OBJ_FLAG_HIDDEN);
+                lv_label_set_long_mode(ctx->rows[i].value_label, LV_LABEL_LONG_CLIP);
+                lv_obj_set_style_text_font(ctx->rows[i].value_label, row_font, LV_PART_MAIN);
+                lv_obj_set_style_text_align(ctx->rows[i].value_label, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+                lv_obj_set_size(ctx->rows[i].value_label, v_w, line_h);
+                lv_obj_set_pos(ctx->rows[i].value_label, cw - dot_s - 8 - v_w, text_y);
+            }
+            mid_index++;
+            continue;
+        }
+
         if (ctx->rows[i].is_status) {
             /* Status row: label on the left, coloured status circle on the
              * right (green = on, red = off). No value text. */
@@ -1001,7 +1257,11 @@ static void sensor_tile_mark_all_unavailable(sensor_tile_ctx_t *ctx)
             lv_bar_set_value(ctx->rows[i].bar, 0, LV_ANIM_OFF);
         }
         if (ctx->rows[i].value_label != NULL && !ctx->rows[i].is_status) {
-            lv_label_set_text(ctx->rows[i].value_label, "--");
+            if (ctx->rows[i].has_label_color) {
+                lv_label_set_text(ctx->rows[i].value_label, "off");
+            } else {
+                lv_label_set_text(ctx->rows[i].value_label, "--");
+            }
         }
     }
 }
@@ -1018,6 +1278,14 @@ static void sensor_tile_event_cb(lv_event_t *event)
 
     lv_event_code_t code = lv_event_get_code(event);
     if (code == LV_EVENT_DELETE) {
+        if (ctx->ping_timer != NULL) {
+            lv_timer_del(ctx->ping_timer);
+            ctx->ping_timer = NULL;
+        }
+        if (ctx->tcp_task != NULL) {
+            vTaskDelete(ctx->tcp_task);
+            ctx->tcp_task = NULL;
+        }
         free(ctx);
     } else if (code == LV_EVENT_SIZE_CHANGED) {
         sensor_tile_apply_layout(ctx);
@@ -1118,7 +1386,13 @@ esp_err_t w_sensor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui_
         }
 
         ctx->rows[i].name_label = lv_label_create(card);
-        lv_obj_set_style_text_color(ctx->rows[i].name_label, theme_default_color_text_primary(), LV_PART_MAIN);
+        if (ctx->rows[i].has_label_color) {
+            /* Group colour on the label text itself (servers/weather/air/
+             * printer); the status dot on the right shows online/offline. */
+            lv_obj_set_style_text_color(ctx->rows[i].name_label, ctx->rows[i].label_color, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_text_color(ctx->rows[i].name_label, theme_default_color_text_primary(), LV_PART_MAIN);
+        }
         lv_label_set_text(ctx->rows[i].name_label, ctx->rows[i].label);
 
         ctx->rows[i].value_label = lv_label_create(card);
@@ -1127,11 +1401,28 @@ esp_err_t w_sensor_tile_create(const ui_widget_def_t *def, lv_obj_t *parent, ui_
             lv_obj_set_style_text_color(ctx->rows[i].value_label, ctx->rows[i].power_color, LV_PART_MAIN);
         }
         lv_label_set_long_mode(ctx->rows[i].value_label, LV_LABEL_LONG_CLIP);
-        lv_label_set_text(ctx->rows[i].value_label, "--");
+        if (ctx->rows[i].has_label_color && !ctx->rows[i].is_status) {
+            lv_label_set_text(ctx->rows[i].value_label, "off");
+        } else {
+            lv_label_set_text(ctx->rows[i].value_label, "--");
+        }
     }
 
     lv_obj_add_event_cb(card, sensor_tile_event_cb, LV_EVENT_DELETE, ctx);
     lv_obj_add_event_cb(card, sensor_tile_event_cb, LV_EVENT_SIZE_CHANGED, ctx);
+
+    /* Start the panel-side TCP checker for ":ping" rows and a refresh timer. */
+    sensor_tile_ping_start(ctx);
+    bool any_ping = false;
+    for (uint8_t i = 0; i < ctx->row_count; i++) {
+        if (ctx->rows[i].is_ping) {
+            any_ping = true;
+            break;
+        }
+    }
+    if (any_ping) {
+        ctx->ping_timer = lv_timer_create(sensor_tile_ping_timer_cb, 1000, ctx);
+    }
 
     sensor_tile_apply_layout(ctx);
 
@@ -1161,10 +1452,19 @@ void w_sensor_tile_apply_state(ui_widget_instance_t *instance, const ha_state_t 
             if (ctx->rows[i].dot != NULL) {
                 lv_obj_set_style_bg_color(ctx->rows[i].dot, status_color, LV_PART_MAIN);
             }
+            /* Group-coloured status rows (e.g. temperature / pm2.5) also
+             * show their numeric value beside the dot. */
+            if (ctx->rows[i].has_label_color && ctx->rows[i].value_label != NULL) {
+                char value_text[256] = {0};
+                sensor_tile_format_state(state, value_text, sizeof(value_text));
+                lv_label_set_text(ctx->rows[i].value_label, value_text);
+            }
             return;
         }
 
-        lv_color_t color = sensor_tile_state_color(state->state);
+        lv_color_t color = ctx->rows[i].has_label_color
+            ? sensor_tile_status_color(state->state)
+            : sensor_tile_state_color(state->state);
         if (ctx->rows[i].is_power && ctx->rows[i].has_power_color) {
             color = ctx->rows[i].power_color;
             if (ctx->rows[i].value_label != NULL) {
@@ -1196,9 +1496,14 @@ void w_sensor_tile_apply_state(ui_widget_instance_t *instance, const ha_state_t 
             }
         }
         if (ctx->rows[i].value_label != NULL) {
-            char value_text[256] = {0};
-            sensor_tile_format_state(state, value_text, sizeof(value_text));
-            lv_label_set_text(ctx->rows[i].value_label, value_text);
+            if (ctx->rows[i].has_label_color) {
+                lv_label_set_text(ctx->rows[i].value_label,
+                                  sensor_tile_status_is_on(state->state) ? "on" : "off");
+            } else {
+                char value_text[256] = {0};
+                sensor_tile_format_state(state, value_text, sizeof(value_text));
+                lv_label_set_text(ctx->rows[i].value_label, value_text);
+            }
         }
         /* A ports row wraps its list, so a changed value can change its
          * height; recompute the whole tile layout to re-flow the rows. */

@@ -455,6 +455,27 @@ static bool ui_runtime_token_entity(const char *start, const char *end, char *ou
         }
     }
 
+    /* Strip auxiliary ":color=X" and ":ping" (panel-side ping, not an HA
+     * entity) before the main style suffix, matching sensor_tile_strip_aux_style(). */
+    {
+        const char *p = start;
+        while (p + 7 <= end) {
+            if (strncmp(p, ":color=", 7) == 0) {
+                end = p;
+                break;
+            }
+            p++;
+        }
+    }
+    bool is_ping = false;
+    {
+        size_t alen = (size_t)(end - start);
+        if (alen >= 5 && strncmp(end - 5, ":ping", 5) == 0) {
+            end -= 5;
+            is_ping = true;
+        }
+    }
+
     /* Strip an optional per-row style suffix. Keep this in sync with
      * ha_client_token_entity() and sensor_tile_strip_row_style():
      * ":bar", ":dot", ":status", ":chart", ":ports", ":ip" and ":power"
@@ -486,6 +507,9 @@ static bool ui_runtime_token_entity(const char *start, const char *end, char *ou
 
     size_t len = (size_t)(end - start);
     if (len == 0 || len >= out_len) {
+        return false;
+    }
+    if (is_ping) {
         return false;
     }
     memcpy(out, start, len);
